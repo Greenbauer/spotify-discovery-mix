@@ -9,7 +9,7 @@ Never used as seeds:
   - recently-played
   - baby / kids / nursery playlists
   - out-of-season holiday playlists
-  - the Weekly Mix playlist itself
+  - the Discovery Mix playlist itself (formerly Weekly Mix)
 
 Discovery is Spotify-first. /recommendations and /related-artists are 403 for
 new apps since 2024-11-27; Dev Mode also lost /artists/{id}/top-tracks and the
@@ -132,6 +132,12 @@ SKIP_SEED_NAME_RE = re.compile(
 )
 
 
+# Product name of the rolling discovery playlist. "Weekly Mix" is the previous
+# name of the same playlist; skip either as a seed/exclude source.
+DEFAULT_PLAYLIST_NAME = "Discovery Mix"
+LEGACY_PLAYLIST_NAMES = frozenset({"weekly mix"})
+
+
 def seasonal_reason(name: str, today: date) -> str | None:
     for rx, in_season in SEASONAL_RULES:
         if rx.search(name) and not in_season(today):
@@ -144,8 +150,14 @@ def output_playlist_reason(name: str, mix_name: str) -> str | None:
 
     Its tracks must NOT join the exclude set — an unheard track from last
     week's mix is deliberately allowed to come back (see played_ids).
+    Weekly Mix and Discovery Mix are the same rolling playlist.
     """
-    if name.strip().lower() == mix_name.strip().lower():
+    n = name.strip().lower()
+    if (
+        n == mix_name.strip().lower()
+        or n == DEFAULT_PLAYLIST_NAME.lower()
+        or n in LEGACY_PLAYLIST_NAMES
+    ):
         return f"output playlist: {name!r}"
     return None
 
@@ -814,7 +826,7 @@ class Candidate:
 
 @dataclass
 class MixConfig:
-    playlist_name: str = "Weekly Mix"
+    playlist_name: str = DEFAULT_PLAYLIST_NAME
     size: int = 40
     min_popularity: int = 55
     max_per_artist: int = 2
@@ -1351,7 +1363,7 @@ def load_client(require_token: bool = True, force_refresh: bool = False) -> Spot
 
 def mix_config_from_env(today: date | None = None) -> MixConfig:
     return MixConfig(
-        playlist_name=env("MIX_PLAYLIST_NAME", "Weekly Mix") or "Weekly Mix",
+        playlist_name=env("MIX_PLAYLIST_NAME", DEFAULT_PLAYLIST_NAME) or DEFAULT_PLAYLIST_NAME,
         size=env_int("MIX_SIZE", 40),
         min_popularity=env_int("MIX_MIN_POPULARITY", 55),
         max_per_artist=env_int("MIX_MAX_PER_ARTIST", 2),
@@ -1811,11 +1823,11 @@ def harvest_plays(
     include_recent: bool = True,
     include_current: bool = True,
 ) -> dict:
-    """Log Weekly Mix tracks that were heard, including short skips.
+    """Log Discovery Mix tracks that were heard, including short skips.
 
     A track counts as heard if:
       - it is currently playing and is on this week's mix, OR the player
-        context is the Weekly Mix playlist, OR
+        context is the Discovery Mix playlist, OR
       - include_recent and it appears in recently-played on this week's mix.
     Recently-played is never used as a taste seed.
 
@@ -2083,7 +2095,7 @@ def cmd_watch_plays(
     """Adaptive now-playing poll so short skips still count without burning quota.
 
     Only calls currently-playing each loop (never recently-played). Sleeps longer
-    when nothing is playing or playback is outside Weekly Mix.
+    when nothing is playing or playback is outside Discovery Mix.
     Defaults: ~12s on the mix, ~60s on other playback, ~90s when idle.
     """
     pid_path = paths.state / "watch_plays.pid"
@@ -2166,12 +2178,15 @@ def cmd_self_test() -> int:
     check(seasonal_reason("Thanksgiving Dinner", date(2026, 11, 10)) is not None, "Thanksgiving skipped early Nov")
     check(seasonal_reason("Thanksgiving Dinner", date(2026, 11, 25)) is None, "Thanksgiving kept late Nov")
     check(seasonal_reason("4th of July BBQ", date(2026, 7, 4)) is None, "July 4 kept on July 4")
-    check(skip_seed_reason("Baby Sleep", today, "Weekly Mix") is not None, "baby playlist skipped")
-    check(skip_seed_reason("Kids Party", today, "Weekly Mix") is not None, "kids playlist skipped")
-    check(skip_seed_reason("Nursery Rhymes", today, "Weekly Mix") is not None, "nursery skipped")
-    check(skip_seed_reason("House Listening", today, "Weekly Mix") is not None, "house listening skipped")
-    check(skip_seed_reason("Weekly Mix", today, "Weekly Mix") is not None, "output playlist skipped")
-    check(skip_seed_reason("Deep Cuts", today, "Weekly Mix") is None, "normal playlist kept")
+    check(skip_seed_reason("Baby Sleep", today, "Discovery Mix") is not None, "baby playlist skipped")
+    check(skip_seed_reason("Kids Party", today, "Discovery Mix") is not None, "kids playlist skipped")
+    check(skip_seed_reason("Nursery Rhymes", today, "Discovery Mix") is not None, "nursery skipped")
+    check(skip_seed_reason("House Listening", today, "Discovery Mix") is not None, "house listening skipped")
+    check(skip_seed_reason("Discovery Mix", today, "Discovery Mix") is not None, "output playlist skipped")
+    check(skip_seed_reason("Weekly Mix", today, "Discovery Mix") is not None, "legacy Weekly Mix name skipped")
+    check(skip_seed_reason("Discovery Mix", today, "Weekly Mix") is not None, "Discovery Mix skipped under legacy mix_name")
+    check(skip_seed_reason("Deep Cuts", today, "Discovery Mix") is None, "normal playlist kept")
+    check(MixConfig().playlist_name == "Discovery Mix", "default playlist name is Discovery Mix")
     ramp0 = [path_c_guessed_popularity(i, 55) for i in range(5)]
     check(all(ramp0[i] > ramp0[i + 1] for i in range(4)), "Path C search ranks are strictly decreasing")
     check(len(set(ramp0)) == len(ramp0), "Path C ranks never share a score")
@@ -2260,6 +2275,7 @@ def cmd_self_test() -> int:
                 {"id": "kids", "name": "Kid A"},
                 {"id": "good", "name": "Deep Cuts"},
                 {"id": "mine", "name": "Weekly Mix"},
+                {"id": "disc", "name": "Discovery Mix"},
             ]
 
         def playlist_items(self, pid: str) -> list[dict]:
@@ -2276,7 +2292,8 @@ def cmd_self_test() -> int:
         check("kids-t" in exclude, "a kids playlist still contributes excludes")
         check("kidsArtist" not in names, "a kids playlist contributes no seeds")
         check("good-t" in exclude and "goodArtist" in names, "a normal playlist does both")
-        check("mine-t" not in exclude, "our own output playlist is skipped entirely")
+        check("mine-t" not in exclude, "legacy Weekly Mix name is skipped entirely")
+        check("disc-t" not in exclude, "our own output playlist is skipped entirely")
         check("liked-t" in exclude, "likes contribute excludes")
 
     # 5. A search-rank guess never outranks a real Spotify popularity score.
@@ -2754,7 +2771,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="overwrite last_mix.json even with a much smaller mix",
     )
-    pub = sub.add_parser("publish", help="create or replace the Weekly Mix playlist")
+    pub = sub.add_parser("publish", help="create or replace the Discovery Mix playlist")
     pub.add_argument("--dry-run", action="store_true", help="print URIs; do not touch Spotify playlists")
     pub.add_argument(
         "--force",
@@ -2785,7 +2802,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--interval",
         type=float,
         default=12.0,
-        help="seconds between polls while Weekly Mix is playing (default 12)",
+        help="seconds between polls while Discovery Mix is playing (default 12)",
     )
     watch.add_argument(
         "--idle-interval",
