@@ -174,7 +174,7 @@ sleep/music/rain.
 | Created playlist, baby/kids/nursery / house listening | no | yes, every track |
 | Created playlist, seasonal name, out of season | no | yes, every track |
 | Created playlist, seasonal name, in season | yes | yes, every track |
-| Discovery Mix output playlist (formerly Weekly Mix) | no | **no** (unheard tracks may return) |
+| Discovery Mix output playlist | no | **no** (unheard tracks may return) |
 | Liked Songs | only if `MIX_USE_LIKES=1` | **always** |
 | `state/played.json` (heard log) | no | yes (track id, plus title+artist so remasters stay out) |
 | Recently-played / `/me/top` | **never** | no (except mix tracks logged as heard) |
@@ -297,7 +297,7 @@ MusicBrainz and ListenBrainz need no key and are not configured.
 
 | Variable | Default | Role |
 |---|---|---|
-| `MIX_PLAYLIST_NAME` | `Discovery Mix` | Output playlist (same rolling playlist formerly named Weekly Mix); never a seed; its tracks are not excludes |
+| `MIX_PLAYLIST_NAME` | `Discovery Mix` | Output playlist; never a seed; its tracks are not excludes |
 | `MIX_SIZE` | `40` | Target length |
 | `MIX_MIN_POPULARITY` | `55` | Gate for **measured** Spotify popularity only. Path C guesses stay below it |
 | `MIX_MAX_PER_ARTIST` | `2` | Diversity cap on the final mix |

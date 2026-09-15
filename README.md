@@ -1,7 +1,6 @@
-# Weekly Spotify discovery mixer
+# Discovery Mix
 
 A ~40-track **novel + popular** Discovery Mix for a personal Spotify account (Grok Bot / local agent).
-The Spotify playlist is the same rolling discovery playlist formerly named Weekly Mix.
 `mix.py` never starts OAuth by itself; `oauth.py` is the one-time, opt-in helper that does
 (see [Setup](#what-we-still-need-from-you)). Registering the Spotify app is still on you.
 
@@ -127,7 +126,7 @@ out-of-season holiday playlists, Spotify's own editorial lists.
 **Excluded from output regardless:** every track in every playlist you created — including
 the ones skipped for seeding — plus Liked Songs and the play log. Skipping a playlist as a
 taste source never makes its tracks eligible to be recommended back to you. The only total
-skip is Discovery Mix itself (including the former Weekly Mix name), so an unheard track
+skip is Discovery Mix itself, so an unheard track
 from last week can still return.
 
 Season from **playlist name** (skipped as seeds unless the current month matches):
@@ -150,7 +149,7 @@ Copy `.env.example` to `.env` (gitignored).
 | `SPOTIFY_CLIENT_SECRET` | yes | Dashboard secret |
 | `SPOTIFY_REFRESH_TOKEN` | yes | Headless token; script refreshes access |
 | `SPOTIFY_ACCESS_TOKEN` | no | Skip refresh if still valid |
-| `MIX_PLAYLIST_NAME` | no | default `Discovery Mix` (same playlist formerly named Weekly Mix) |
+| `MIX_PLAYLIST_NAME` | no | default `Discovery Mix` |
 | `MIX_SIZE` | no | default `40` |
 | `MIX_MIN_POPULARITY` | no | default `55` |
 | `MIX_MAX_PER_ARTIST` | no | default `2` |

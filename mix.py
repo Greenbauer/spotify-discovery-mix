@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Weekly Spotify discovery mixer.
+"""Spotify Discovery Mix.
 
 Seeds taste from playlists YOU created (owner == you). Liked Songs are an
 optional artist/track seed only — never the output pool.
@@ -9,7 +9,7 @@ Never used as seeds:
   - recently-played
   - baby / kids / nursery playlists
   - out-of-season holiday playlists
-  - the Discovery Mix playlist itself (formerly Weekly Mix)
+  - the Discovery Mix playlist itself
 
 Discovery is Spotify-first. /recommendations and /related-artists are 403 for
 new apps since 2024-11-27; Dev Mode also lost /artists/{id}/top-tracks and the
@@ -59,7 +59,7 @@ SPOTIFY_ACCOUNTS = "https://accounts.spotify.com/api/token"
 MB_API = "https://musicbrainz.org/ws/2"
 LB_SIMILAR = "https://labs.api.listenbrainz.org/similar-artists/json"
 LB_SIMILAR_ALGO = "session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_skip_30"
-UA = "spotify-weekly-mix/1.0 (personal discovery mixer)"
+UA = "spotify-discovery-mix/1.0 (personal discovery mixer)"
 
 # A rebuilt mix this much smaller than the one it replaces is a failed build,
 # not a new mix. build_mix overwrites last_mix.json BEFORE publish is ever
@@ -132,10 +132,8 @@ SKIP_SEED_NAME_RE = re.compile(
 )
 
 
-# Product name of the rolling discovery playlist. "Weekly Mix" is the previous
-# name of the same playlist; skip either as a seed/exclude source.
+# Product name of the rolling discovery playlist.
 DEFAULT_PLAYLIST_NAME = "Discovery Mix"
-LEGACY_PLAYLIST_NAMES = frozenset({"weekly mix"})
 
 
 def seasonal_reason(name: str, today: date) -> str | None:
@@ -150,14 +148,9 @@ def output_playlist_reason(name: str, mix_name: str) -> str | None:
 
     Its tracks must NOT join the exclude set — an unheard track from last
     week's mix is deliberately allowed to come back (see played_ids).
-    Weekly Mix and Discovery Mix are the same rolling playlist.
+    Only the configured mix name matches.
     """
-    n = name.strip().lower()
-    if (
-        n == mix_name.strip().lower()
-        or n == DEFAULT_PLAYLIST_NAME.lower()
-        or n in LEGACY_PLAYLIST_NAMES
-    ):
+    if name.strip().lower() == mix_name.strip().lower():
         return f"output playlist: {name!r}"
     return None
 
@@ -2183,9 +2176,10 @@ def cmd_self_test() -> int:
     check(skip_seed_reason("Nursery Rhymes", today, "Discovery Mix") is not None, "nursery skipped")
     check(skip_seed_reason("House Listening", today, "Discovery Mix") is not None, "house listening skipped")
     check(skip_seed_reason("Discovery Mix", today, "Discovery Mix") is not None, "output playlist skipped")
-    check(skip_seed_reason("Weekly Mix", today, "Discovery Mix") is not None, "legacy Weekly Mix name skipped")
-    check(skip_seed_reason("Discovery Mix", today, "Weekly Mix") is not None, "Discovery Mix skipped under legacy mix_name")
+    check(skip_seed_reason("discovery mix", today, "Discovery Mix") is not None, "output playlist match is case-insensitive")
     check(skip_seed_reason("Deep Cuts", today, "Discovery Mix") is None, "normal playlist kept")
+    check(skip_seed_reason("Discovery Mix", today, "Custom Mix") is None, "unconfigured name is not the output playlist")
+    check(skip_seed_reason("Custom Mix", today, "Custom Mix") is not None, "configured mix name is skipped")
     check(MixConfig().playlist_name == "Discovery Mix", "default playlist name is Discovery Mix")
     ramp0 = [path_c_guessed_popularity(i, 55) for i in range(5)]
     check(all(ramp0[i] > ramp0[i + 1] for i in range(4)), "Path C search ranks are strictly decreasing")
@@ -2274,7 +2268,6 @@ def cmd_self_test() -> int:
             return [
                 {"id": "kids", "name": "Kid A"},
                 {"id": "good", "name": "Deep Cuts"},
-                {"id": "mine", "name": "Weekly Mix"},
                 {"id": "disc", "name": "Discovery Mix"},
             ]
 
@@ -2292,7 +2285,6 @@ def cmd_self_test() -> int:
         check("kids-t" in exclude, "a kids playlist still contributes excludes")
         check("kidsArtist" not in names, "a kids playlist contributes no seeds")
         check("good-t" in exclude and "goodArtist" in names, "a normal playlist does both")
-        check("mine-t" not in exclude, "legacy Weekly Mix name is skipped entirely")
         check("disc-t" not in exclude, "our own output playlist is skipped entirely")
         check("liked-t" in exclude, "likes contribute excludes")
 
@@ -2761,7 +2753,7 @@ def cmd_self_test() -> int:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Weekly Spotify discovery mixer (no live OAuth).")
+    p = argparse.ArgumentParser(description="Spotify Discovery Mix (no live OAuth).")
     p.add_argument("--state-dir", default=str(DEFAULT_STATE))
     p.add_argument("--env-file", default=str(ROOT / ".env"))
     sub = p.add_subparsers(dest="cmd", required=True)
