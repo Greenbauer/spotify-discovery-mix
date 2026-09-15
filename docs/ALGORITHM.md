@@ -1,4 +1,4 @@
-# Weekly Mix algorithm
+# Discovery Mix algorithm
 
 This is the business-logic record for `mix.py`. Product rules below are locked.
 Do not invent opposing ones. Taste quality lives here; token/error hardening
@@ -36,7 +36,7 @@ play. Those endpoints would expand similar-artist graphs from that pollution
 and the mix would sound like the last week's speakers, not the playlists they
 chose to keep.
 
-Recently-played is used only by `log_plays` / `watch_plays` to mark Weekly Mix
+Recently-played is used only by `log_plays` / `watch_plays` to mark Discovery Mix
 tracks as heard. It is never a seed.
 
 Liked Songs are **excludes always**. They become artist seeds only when
@@ -47,9 +47,9 @@ Liked Songs are **excludes always**. They become artist seeds only when
 ```
 created playlists (owner == the user)
         |
-        |- EXCLUDE: every track (except the Weekly Mix output playlist itself)
+        |- EXCLUDE: every track (except the Discovery Mix output playlist itself)
         |- skip seeding: seasonal (wrong month), baby/kids/nursery,
-        |                "house listening", the Weekly Mix playlist
+        |                "house listening", the Discovery Mix playlist
         +- SEED: primary artist on each remaining track
                  (drop names shorter than 3 chars / blocked words)
                  (drop artists with fewer than MIX_MIN_SEED_COUNT appearances,
@@ -75,7 +75,7 @@ created playlists (owner == the user)
      MIX_MAX_PATH_C only when real Spotify-popularity tracks are also in the pool
                 |
                 v
-     last_mix.json -> publish replaces the Weekly Mix playlist
+     last_mix.json -> publish replaces the Discovery Mix playlist
 ```
 
 ## Path B / Path C (Spotify-first popularity)
@@ -174,7 +174,7 @@ sleep/music/rain.
 | Created playlist, baby/kids/nursery / house listening | no | yes, every track |
 | Created playlist, seasonal name, out of season | no | yes, every track |
 | Created playlist, seasonal name, in season | yes | yes, every track |
-| Weekly Mix output playlist | no | **no** (unheard tracks may return) |
+| Discovery Mix output playlist (formerly Weekly Mix) | no | **no** (unheard tracks may return) |
 | Liked Songs | only if `MIX_USE_LIKES=1` | **always** |
 | `state/played.json` (heard log) | no | yes |
 | Recently-played / `/me/top` | **never** | no (except mix tracks logged as heard) |
@@ -191,7 +191,7 @@ Season from **playlist name** (skipped as seeds unless the current month matches
 
 ## Rolling playlist
 
-The live Weekly Mix is a sliding window, not only a frozen Monday dump.
+The live Discovery Mix is a sliding window, not only a frozen Monday dump.
 `roll_playlist` does not invent a second recommender. It calls `Mixer.build`
 with a smaller `target_size` and extra exclude ids, so Path C ranking, junk
 filters, primary-only seeds, and National Forest resolve all still apply.
@@ -289,7 +289,7 @@ MusicBrainz and ListenBrainz need no key and are not configured.
 
 | Variable | Default | Role |
 |---|---|---|
-| `MIX_PLAYLIST_NAME` | `Weekly Mix` | Output playlist; never a seed; its tracks are not excludes |
+| `MIX_PLAYLIST_NAME` | `Discovery Mix` | Output playlist (same rolling playlist formerly named Weekly Mix); never a seed; its tracks are not excludes |
 | `MIX_SIZE` | `40` | Target length |
 | `MIX_MIN_POPULARITY` | `55` | Gate for **measured** Spotify popularity only. Path C guesses stay below it |
 | `MIX_MAX_PER_ARTIST` | `2` | Diversity cap on the final mix |
