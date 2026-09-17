@@ -16,7 +16,7 @@ before changing taste.
 .venv/bin/python mix.py log_plays     # record plays of OUR playlist only
 .venv/bin/python mix.py probe         # which Spotify endpoints still work
 .venv/bin/python mix.py ingest_ui     # mark mix tracks from a now-playing JSONL
-.venv/bin/python mix.py roll_playlist # drop delayed hears; append discoveries (~40)
+.venv/bin/python mix.py roll_playlist # drop delayed hears + songs you already own; append discoveries (~40)
 .venv/bin/python mix.py maybe_refresh # if the current mix is used up, publish a new one
 .venv/bin/python mix.py watch_plays   # adaptive now-playing poll so short skips count
 ```
@@ -216,6 +216,10 @@ When detection marks a mix track as heard, `roll_playlist` waits
 at the top in the same relative order. New discovery tracks (same Mixer
 pipeline as `build_mix`, including Path C / junk / primary-only seeds) append
 at the bottom so the playlist stays about `MIX_SIZE` (40).
+
+Heard means the track id **or its title+artist** is in the play log: Spotify often
+logs a play under a different release id than the playlist holds. A song that is
+already in one of your playlists or Liked Songs is removed too, with no delay.
 
 A track heard less recently than the delay stays put. If nothing is eligible
 to remove and the playlist is already about `MIX_SIZE`, the command prints
