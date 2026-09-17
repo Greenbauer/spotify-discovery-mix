@@ -170,14 +170,20 @@ sleep/music/rain.
 
 | Source | Seeds? | Excludes from output? |
 |---|---|---|
-| Created playlist, normal name | yes (primary artists) | yes, every track |
+| Created playlist, normal name | yes (primary artists) | yes, every track (track id, plus title+artist) |
 | Created playlist, baby/kids/nursery / house listening | no | yes, every track |
 | Created playlist, seasonal name, out of season | no | yes, every track |
 | Created playlist, seasonal name, in season | yes | yes, every track |
 | Discovery Mix output playlist | no | **no** (unheard tracks may return) |
-| Liked Songs | only if `MIX_USE_LIKES=1` | **always** |
+| Liked Songs | only if `MIX_USE_LIKES=1` | **always** (track id, plus title+artist) |
 | `state/played.json` (heard log) | no | yes (track id, plus title+artist so remasters stay out) |
 | Recently-played / `/me/top` | **never** | no (except mix tracks logged as heard) |
+
+A Spotify track id names one **release**, not one recording: the album cut, the
+single, a remaster and a market relink all carry different ids. So both the heard
+log **and your library** (created playlists + Liked Songs) match on track id plus
+title+artist, through one key builder (`_title_keys`). Without the library half, a
+song you had liked came back as a "discovery" under its other release id.
 
 Heard-log matching is track id plus title+artist. `_title_base` strips remaster /
 version / remix / feat parentheses and `- remaster/...` suffixes so an alternate
@@ -210,11 +216,17 @@ filters, primary-only seeds, and National Forest resolve all still apply.
    `playlist_id`, `state/played.json`, `state/last_mix.json`, and the
    current Spotify playlist items (`GET /playlists/{id}/items`, fallback
    `/tracks`).
-3. A playlist track is **eligible to remove** only when its id is in the
-   heard set **and** its `played_at` (or `ts` / `heard_at`) is at least
+3. A playlist track is **eligible to remove** when it was heard: its id **or
+   its title+artist** is in the heard log (a play is often logged under a
+   different release id than the playlist holds, and id-only matching left
+   those tracks on the playlist forever) **and** its `played_at` (or `ts` / `heard_at`) is at least
    `MIX_ROLL_DELAY_MIN` minutes ago (default **5**). A track heard more
    recently stays on the playlist. A heard row with no parseable timestamp
    is treated as old enough.
+   A track is also removed, with **no delay**, when it is already in your
+   library (a created playlist or Liked Songs), by id or title+artist. That
+   covers a song you like after it lands here. The roll reads your library on
+   every run for this, including runs that would otherwise be a noop.
 4. Remaining tracks (unheard, or heard but still inside the delay) keep
    their current relative order and stay at the **top**.
 5. Need `MIX_SIZE` (default 40) minus `len(remaining)` new tracks. Build
@@ -228,7 +240,9 @@ filters, primary-only seeds, and National Forest resolve all still apply.
    discoveries land at the bottom.
 7. Rewrite `last_mix.json` `tracks` to match the new playlist. Keep week
    and `published_at` from the Monday publish. Update `config.track_count`.
-8. Print a quiet summary: `ROLL removed=N kept=K added=A size=S`.
+8. Print a quiet summary: `ROLL removed=N kept=K added=A size=S`, followed by
+   why tracks left, e.g. `(heard_id=2 heard_title=1 owned_title=1)`. A
+   `*_title` count is the different-release-id case.
    If nothing is eligible to remove and the playlist is already about
    `MIX_SIZE`, print `ROLL noop` and exit 0.
 

@@ -945,6 +945,7 @@ class Mixer:
         seed_artist_names: Counter = Counter()
         seed_playlists: list[dict] = []
         skipped_seeding: list[str] = []
+        owned: list[dict] = []
 
         print(f"created playlists: {len(created)}")
         for pl in created:
@@ -954,6 +955,7 @@ class Mixer:
                 continue
 
             tracks = self.sp.playlist_items(pl["id"])
+            owned.extend(tracks)
             for t in tracks:
                 if t.get("id"):
                     exclude.add(t["id"])
@@ -972,6 +974,7 @@ class Mixer:
         # Likes are always excludes ("likes = seeds + exclude" per the README);
         # MIX_USE_LIKES only decides whether they also seed.
         likes = self.sp.liked_tracks()
+        owned.extend(likes)
         for t in likes:
             if t.get("id"):
                 exclude.add(t["id"])
@@ -983,6 +986,11 @@ class Mixer:
             print(f"liked songs (excludes only): {len(likes)}")
 
         print(f"seed playlists:    {len(seed_playlists)}")
+        # Owned = playlists + likes only. Kept apart from the heard log so the
+        # roll can drop owned tracks at once while heard ones wait out the delay.
+        self.owned_ids = set(exclude)
+        # Same song, different release id: the exclude ids above miss it.
+        self.owned_title_keys = _title_keys(owned)
         exclude |= self.played_ids()
         print(f"exclude track ids: {len(exclude)}")
         return seed_playlists, exclude, seed_artist_names
@@ -1213,6 +1221,7 @@ class Mixer:
         pool: list[Candidate] = []
         seen_ids = set(exclude)
         heard_keys = _heard_title_keys(read_json(self.paths.played, {"plays": []}))
+        heard_keys |= self.owned_title_keys
         for _artist, cands in ordered_groups:
             artist_has_measured = any(c.measured for c in cands)
             for cand in cands:
@@ -1565,10 +1574,14 @@ def cmd_roll_playlist(
     sp: Spotify | None = None,
     now: datetime | None = None,
     build_fn: Any = None,
+    library_fn: Any = None,
     mix_size: int | None = None,
     delay_min: int | None = None,
 ) -> int:
-    """Remove delayed-heard tracks and append discoveries so the mix stays ~MIX_SIZE.
+    """Remove delayed-heard and owned tracks, then top up so the mix stays ~MIX_SIZE.
+
+    `library_fn() -> (owned_ids, owned_title_keys)` is injectable for tests,
+    like build_fn; by default it reads your playlists and Liked Songs.
 
     Does not ping anyone and does not poll currently-playing.
     """
@@ -1583,7 +1596,22 @@ def cmd_roll_playlist(
     client = sp or load_client()
     current = client.playlist_items(playlist_id)
     played = read_json(paths.played, {"plays": []})
-    plan = plan_roll(current, played, delay_min=delay, mix_size=size, now=now)
+    if library_fn is None:
+        mixer = Mixer(client, paths, cfg)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mixer.collect_library(config.get("user_id") or client.me()["id"])
+        owned_ids, owned_keys = mixer.owned_ids, mixer.owned_title_keys
+    else:
+        owned_ids, owned_keys = library_fn()
+    plan = plan_roll(
+        current,
+        played,
+        delay_min=delay,
+        mix_size=size,
+        now=now,
+        owned_ids=owned_ids,
+        owned_keys=owned_keys,
+    )
     if plan.noop:
         print("ROLL noop")
         return 0
@@ -1614,9 +1642,10 @@ def cmd_roll_playlist(
     config["track_count"] = len(uris)
     config["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_json(paths.config, config)
+    why = " ".join(f"{k}={v}" for k, v in sorted(plan.reasons.items()))
     print(
         f"ROLL removed={len(plan.removed)} kept={len(plan.remaining)} "
-        f"added={len(new_tracks)} size={len(uris)}"
+        f"added={len(new_tracks)} size={len(uris)}" + (f" ({why})" if why else "")
     )
     return 0
 
@@ -1659,18 +1688,26 @@ def removable_heard_ids(
     already in the heard log. Too-recent timestamps stay off this set so the
     song remains on the playlist until the delay elapses.
     """
+    return {row["track_id"] for row in _removable_heard_rows(played, delay_min, now)}
+
+
+def _removable_heard_rows(
+    played: dict,
+    delay_min: int,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Heard-log rows old enough to roll off (see removable_heard_ids)."""
     now = now or datetime.now(timezone.utc)
     delay = timedelta(minutes=max(0, int(delay_min)))
-    out: set[str] = set()
+    out: list[dict] = []
     for row in played.get("plays") or []:
-        tid = row.get("track_id")
-        if not tid:
+        if not row.get("track_id"):
             continue
         when = parse_played_at(
             row.get("played_at") or row.get("ts") or row.get("heard_at")
         )
         if when is None or (now - when) >= delay:
-            out.add(tid)
+            out.append(row)
     return out
 
 
@@ -1680,19 +1717,38 @@ class RollPlan:
     removed: list[dict]
     need: int
     noop: bool
+    # Why each track left, for the ROLL summary line: heard_id / heard_title /
+    # owned_id / owned_title. The *_title counts are the different-release-id case.
+    reasons: Counter = field(default_factory=Counter)
 
 
 def partition_playlist(
     current_tracks: list[dict],
     removable_ids: set[str],
+    removable_keys: set[str] | None = None,
+    reasons: Counter | None = None,
+    label: str = "heard",
 ) -> tuple[list[dict], list[dict]]:
-    """Split current playlist items, preserving order of each side."""
+    """Split current playlist items, preserving order of each side.
+
+    A track leaves when its id matches OR its title+artist does. Id alone
+    misses a song that was heard (or is owned) under another release id, which
+    is how a played track used to sit on the playlist forever.
+    """
+    keys = removable_keys or set()
     remaining: list[dict] = []
     removed: list[dict] = []
     for track in current_tracks:
         tid = track.get("id")
+        why = None
         if tid and tid in removable_ids:
+            why = f"{label}_id"
+        elif keys and _candidate_heard_by_title(track.get("name") or "", artist_names(track), keys):
+            why = f"{label}_title"
+        if why:
             removed.append(track)
+            if reasons is not None:
+                reasons[why] += 1
         else:
             remaining.append(track)
     return remaining, removed
@@ -1705,12 +1761,33 @@ def plan_roll(
     delay_min: int,
     mix_size: int,
     now: datetime | None = None,
+    owned_ids: set[str] | None = None,
+    owned_keys: set[str] | None = None,
 ) -> RollPlan:
-    removable = removable_heard_ids(played, delay_min, now)
-    remaining, removed = partition_playlist(current_tracks, removable)
+    """Decide what leaves the playlist: heard (after the delay) and owned (at once).
+
+    Owned = already in one of your playlists or Liked Songs. Discovery keeps
+    those out at build time, but a track you like AFTER it lands here, or one
+    that slipped in under another release id, has to be caught on the roll.
+    """
+    reasons: Counter = Counter()
+    rows = _removable_heard_rows(played, delay_min, now)
+    remaining, removed = partition_playlist(
+        current_tracks,
+        {row["track_id"] for row in rows},
+        _title_keys(rows),
+        reasons,
+        "heard",
+    )
+    remaining, owned = partition_playlist(
+        remaining, owned_ids or set(), owned_keys or set(), reasons, "owned"
+    )
+    removed = removed + owned
     need = max(0, mix_size - len(remaining))
     noop = (not removed) and len(remaining) >= mix_size
-    return RollPlan(remaining=remaining, removed=removed, need=need, noop=noop)
+    return RollPlan(
+        remaining=remaining, removed=removed, need=need, noop=noop, reasons=reasons
+    )
 
 
 def assemble_roll_uris(remaining: list[dict], new_tracks: list[Candidate]) -> list[str]:
@@ -1952,13 +2029,22 @@ def _title_base(name: str) -> str:
 
 
 def _heard_title_keys(played: dict) -> set[str]:
-    """Build title|artist keys from the heard log.
+    """Title|artist keys for every row in the heard log."""
+    return _title_keys(played.get("plays") or [])
+
+
+def _title_keys(rows: Any) -> set[str]:
+    """Build title|artist keys from play-log rows or Spotify track objects.
+
+    A Spotify track id names one RELEASE, not one recording: the album cut, the
+    single, a remaster and a market relink all carry different ids. Matching on
+    id alone lets a song you already heard or own come back under another id.
 
     Legacy rows with a title but no artists use `title|*` so remasters still
     stay out. Rows that include artists are keyed per artist, never title-only.
     """
     keys: set[str] = set()
-    for row in played.get("plays") or []:
+    for row in rows:
         name = row.get("name") or row.get("title")
         if not name:
             continue
@@ -2631,7 +2717,13 @@ def cmd_self_test() -> int:
 
         fake = _RollSp()
         rc = cmd_roll_playlist(
-            p, sp=fake, now=roll_now, build_fn=_build, mix_size=4, delay_min=5
+            p,
+            sp=fake,
+            now=roll_now,
+            build_fn=_build,
+            library_fn=lambda: (set(), set()),
+            mix_size=4,
+            delay_min=5,
         )
         check(rc == 0, "roll_playlist returns 0")
         check(fake.replace_calls == 1, "replace_playlist_tracks is called once")
@@ -2673,7 +2765,13 @@ def cmd_self_test() -> int:
             return []
 
         rc = cmd_roll_playlist(
-            p, sp=noop_sp, now=roll_now, build_fn=_no_build, mix_size=4, delay_min=5
+            p,
+            sp=noop_sp,
+            now=roll_now,
+            build_fn=_no_build,
+            library_fn=lambda: (set(), set()),
+            mix_size=4,
+            delay_min=5,
         )
         check(
             rc == 0 and noop_sp.replaced is None and not built,
@@ -2747,6 +2845,100 @@ def cmd_self_test() -> int:
         stored["plays"][0].get("artists") == ["Of Monsters and Men"],
         "_append_heard stores artists on the play row",
     )
+
+
+    # ---------------------------------------------------------------- same song, different id
+    # A Spotify id names a RELEASE. The album cut, the single, a remaster and a
+    # market relink all differ, so id-only matching let played and owned songs
+    # sit on the playlist. Reported 2026-09-17 against the live Discovery Mix.
+    def _pl(tid: str, name: str, artist: str) -> dict:
+        return {"id": tid, "name": name, "artists": [{"id": "a", "name": artist}]}
+
+    live = [
+        _pl("PL_holdon", "Hold On", "Alabama Shakes"),
+        _pl("PL_lasso", "Lasso", "Phoenix"),
+        _pl("PL_flutes", "Flutes", "Hot Chip"),
+        _pl("PL_stay", "Stay", "Rihanna"),
+    ]
+    heard_other_id = {
+        "plays": [
+            {
+                "track_id": "RELINKED_holdon",
+                "name": "Hold On - Remastered",
+                "artists": ["Alabama Shakes"],
+                "played_at": (roll_now - timedelta(hours=2)).isoformat(),
+            },
+            {
+                "track_id": "RELINKED_lasso",
+                "name": "Lasso",
+                "artists": ["Phoenix"],
+                "played_at": (roll_now - timedelta(minutes=1)).isoformat(),
+            },
+        ]
+    }
+    plan = plan_roll(live, heard_other_id, delay_min=5, mix_size=4, now=roll_now)
+    check(
+        [t["id"] for t in plan.removed] == ["PL_holdon"],
+        "a track heard under a different release id still rolls off",
+    )
+    check(
+        "PL_lasso" in [t["id"] for t in plan.remaining],
+        "title matching still honours the roll delay",
+    )
+    check(plan.reasons == Counter({"heard_title": 1}), "roll reports why a track left")
+
+    plan = plan_roll(
+        live,
+        {"plays": []},
+        delay_min=5,
+        mix_size=4,
+        now=roll_now,
+        owned_ids={"PL_flutes"},
+        owned_keys=_title_keys([_pl("LIKED_holdon", "Hold On", "Alabama Shakes"),
+                                _pl("LIKED_stay", "Stay", "The Kid LAROI")]),
+    )
+    check(
+        sorted(t["id"] for t in plan.removed) == ["PL_flutes", "PL_holdon"],
+        "tracks already in your library leave the mix, by id or by title",
+    )
+    check(
+        "PL_stay" in [t["id"] for t in plan.remaining],
+        "a same-titled song by a different artist is not treated as owned",
+    )
+    check(not plan.noop and plan.need == 2, "owned removals trigger a top-up")
+
+    # The real build(): a liked song must not come back under another release id.
+    class _LibSp:
+        caps = SpotifyCaps()
+
+        def created_playlists(self, uid: str) -> list[dict]:
+            return [{"id": "p1", "name": "Deep Cuts"}]
+
+        def playlist_items(self, pid: str) -> list[dict]:
+            return [_pl("s1", "Seed One", "Seed Band"), _pl("s2", "Seed Two", "Seed Band")]
+
+        def liked_tracks(self) -> list[dict]:
+            return [_pl("LIKED_ALBUM_holdon", "Hold On", "Alabama Shakes")]
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        mx = Mixer.__new__(Mixer)
+        mx.sp, mx.paths, mx.cfg = _LibSp(), p, MixConfig(today=today)
+        mx._similar_cache = {}
+        mx.similar_for = lambda name, limit=8: ["Alabama Shakes"]
+        mx.popular_tracks_for = lambda artist, n=8: [
+            Candidate("SINGLE_holdon", "spotify:track:SINGLE_holdon", "Hold On",
+                      ["Alabama Shakes"], ["a"], 70, "s"),
+            Candidate("NEW_song", "spotify:track:NEW_song", "Gimme All Your Love",
+                      ["Alabama Shakes"], ["a"], 70, "s"),
+        ]
+        with contextlib.redirect_stdout(io.StringIO()):
+            built = Mixer.build(mx, {"id": "u1"}, target_size=5)
+        check(
+            [c.track_id for c in built] == ["NEW_song"],
+            "build skips a song you own under a different release id",
+        )
+        check("LIKED_ALBUM_holdon" in mx.owned_ids, "owned ids exclude the heard log")
 
     print("self_test failures:", failures)
     return 1 if failures else 0
