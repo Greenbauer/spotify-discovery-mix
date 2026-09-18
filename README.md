@@ -9,6 +9,7 @@ Business-logic decisions (seeds, excludes, Path B/C, failure modes) are in
 before changing taste.
 
 ```
+./scripts/ensure_venv.sh              # recreate .venv if missing/broken (import requests)
 .venv/bin/python mix.py self_test     # local filters, no network
 .venv/bin/python mix.py build_mix     # compute 40 tracks (needs tokens)
 .venv/bin/python mix.py publish       # create/replace "Discovery Mix"
@@ -19,7 +20,16 @@ before changing taste.
 .venv/bin/python mix.py roll_playlist # drop delayed hears + songs you already own; append discoveries (~40)
 .venv/bin/python mix.py maybe_refresh # if the current mix is used up, publish a new one
 .venv/bin/python mix.py watch_plays   # adaptive now-playing poll so short skips count
+python3 scripts/watcher_health.py     # skip-logger health JSON (not watcher_alive)
 ```
+
+Run `./scripts/ensure_venv.sh` before mix commands. If `.venv` is gone, falling
+through to system `python3` quietly drops `requests` and skip ingest/publish
+degrade. `state/watcher_alive` is a keep-alive touch file only: it can stay
+fresh while `state/nowplaying.jsonl` is frozen on one title. Use
+`scripts/watcher_health.py` (stale content, frozen bar, keep-alive mask). Do
+not add a currently-playing poll to compensate; that burns Dev Mode quota.
+Skip detection stays the web-player bar log.
 
 `build_mix` and `publish` take `--force` to overwrite a mix much smaller than the one it
 replaces. Without it they refuse, so a rate-limited build cannot destroy a good mix.
@@ -167,6 +177,7 @@ Copy `.env.example` to `.env` (gitignored).
 | `played.json` | `log_plays` | track ids played *from our playlist URI* |
 | `similar_cache.json` | `build_mix` | ListenBrainz similar-artist cache (14d) |
 | `nowplaying.jsonl` | `scripts/nowplaying_*.py` | web-player now-playing log, read by `ingest_ui` |
+| `watcher_alive` | skip-logger keep-alive | mtime only; **not** health. Use `scripts/watcher_health.py` |
 | `watch_plays.pid` | `watch_plays` | pid of the running watcher |
 
 JSON under `state/` is gitignored except `.gitkeep`.
@@ -202,7 +213,11 @@ JSON under `state/` is gitignored except `.gitkeep`.
 3. After first `publish`, run the hourly play-log / skip-watcher so heard mix
    tracks drop off and stay out of the next pool:
 
-   `ingest_ui` → `log_plays --recent-only` → `roll_playlist` → `maybe_refresh`
+   `ensure_venv` → `watcher_health` → `ingest_ui` → `log_plays --recent-only` → `roll_playlist` → `maybe_refresh`
+
+   `watcher_health` is the skip-logger check (`nowplaying.jsonl` recency and a
+   frozen title+artists run). `watcher_alive` alone is not that check. The
+   hourly path still does not poll currently-playing.
 
    `maybe_refresh` is the full rebuild when the mix is empty or aged. Monday
    `publish` still overwrites the whole playlist for a fresh week.
@@ -236,7 +251,7 @@ mix.py            the mixer CLI
 oauth.py          one-time OAuth helper (writes .env, mode 600)
 docs/ALGORITHM.md business logic (seeds, excludes, Path B/C, rolling)
 requirements.txt .env.example
-scripts/          optional web-player skip helpers
+scripts/          skip-logger helpers (nowplaying, ensure_venv, watcher_health)
 state/            local only (gitignored JSON)
 ```
 

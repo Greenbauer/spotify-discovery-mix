@@ -267,8 +267,28 @@ remove 1, keep 39, add 1 at the bottom, size 40.
 Skip-watcher / play-log should run, in order:
 
 ```
-ingest_ui → log_plays --recent-only → roll_playlist → maybe_refresh
+ensure_venv → watcher_health → ingest_ui → log_plays --recent-only → roll_playlist → maybe_refresh
 ```
+
+`./scripts/ensure_venv.sh` recreates `.venv` and installs `requirements.txt`
+when the venv is missing or cannot `import requests`. Mix commands must use
+`.venv/bin/python` after that. System python is a silent degrade.
+
+Skip detection is the web-player bar log (`state/nowplaying.jsonl`), not a
+Spotify currently-playing loop. `state/watcher_alive` is a keep-alive touch
+file only. It can stay fresh while the JSONL is frozen on one title for
+hours. Health is `scripts/watcher_health.py`:
+
+- **stale content** if there are no lines, or the last line is older than
+  `--stale-hours` (default 6)
+- **frozen bar** if the same `title|artists` has run continuously for
+  `--frozen-hours` (default 2)
+- **keep-alive mask** when `watcher_alive` is fresh (mtime younger than 1h)
+  but content is stale or frozen. Treat that as unhealthy and ping. Do not
+  treat `watcher_alive` mtime as health.
+
+Do **not** add currently-playing polling to compensate for a stale or frozen
+bar. That burns Dev Mode quota. Reload the web player / skip-logger instead.
 
 Monday `publish` is still a full overwrite (fresh week). Rolling is the
 mid-week path.
@@ -304,6 +324,8 @@ one-track top-up is the intended write.
 | Path C lookalikes | Search returns the wrong act | Primary-artist match; still possible if Spotify's first hit is wrong |
 | Dev Mode quota | 429 on search / playlist reads | Thin builds are refused; re-run when quota recovers |
 | Unreadable playlist | Used to look empty and drop excludes | `playlist_items` now raises on non-404 errors |
+| Missing / broken `.venv` | Mix commands fall through to system python; `import requests` fails | `./scripts/ensure_venv.sh` before mix commands |
+| Frozen now-playing bar | `watcher_alive` stays fresh; `nowplaying.jsonl` stuck on one title; ingest sees nothing new | `scripts/watcher_health.py`; reload the web player. Do not poll currently-playing |
 
 ## Knobs (`.env.example`)
 

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -2939,6 +2940,69 @@ def cmd_self_test() -> int:
             "build skips a song you own under a different release id",
         )
         check("LIKED_ALBUM_holdon" in mx.owned_ids, "owned ids exclude the heard log")
+
+    # 13. Skip-logger health: watcher_alive can be fresh while nowplaying.jsonl
+    #     is stale or frozen on one title. No network; synthetic log rows.
+    _wh_spec = importlib.util.spec_from_file_location(
+        "watcher_health", ROOT / "scripts" / "watcher_health.py"
+    )
+    check(_wh_spec is not None and _wh_spec.loader is not None, "watcher_health.py loads")
+    if _wh_spec is None or _wh_spec.loader is None:
+        print("self_test failures:", failures)
+        return 1
+    _wh = importlib.util.module_from_spec(_wh_spec)
+    _wh_spec.loader.exec_module(_wh)
+    health_now = datetime(2026, 9, 18, 18, 0, tzinfo=timezone.utc)
+
+    def _np(hours_ago: float, title: str, artists: str = "A") -> dict:
+        ts = (health_now - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {"ts": ts, "title": title, "artists": artists}
+
+    empty = _wh.assess_health(records=[], now=health_now)
+    check(empty["stale_content"] and not empty["ok"], "empty nowplaying is stale")
+    check(not empty["frozen_bar"], "empty nowplaying is not a frozen bar")
+    check(empty["needs_user_ping"], "stale nowplaying needs a user ping")
+    check(not empty["keep_alive_mask"], "missing watcher_alive is not a keep-alive mask")
+
+    fresh = _wh.assess_health(
+        records=[_np(0.1, "Song A"), _np(0.05, "Song B")],
+        now=health_now,
+        alive_mtime_at=health_now - timedelta(minutes=10),
+    )
+    check(fresh["ok"] and not fresh["stale_content"] and not fresh["frozen_bar"], "recent title change is healthy")
+    check(not fresh["keep_alive_mask"], "healthy content is not a keep-alive mask")
+
+    frozen = _wh.assess_health(
+        records=[_np(3.0, "Stuck")],
+        now=health_now,
+        alive_mtime_at=health_now - timedelta(minutes=5),
+    )
+    check(frozen["frozen_bar"] and not frozen["stale_content"], "same title for 3h is frozen, not yet stale")
+    check(not frozen["ok"] and frozen["keep_alive_mask"], "fresh watcher_alive cannot mask a frozen bar")
+    check(frozen["last_title"] == "Stuck", "frozen report keeps the last title")
+
+    run = _wh.assess_health(
+        records=[_np(3.0, "Loop"), _np(0.1, "Loop")],
+        now=health_now,
+        alive_mtime_at=health_now - timedelta(minutes=5),
+    )
+    check(run["frozen_bar"] and not run["stale_content"], "same title|artists run starts at the first matching line")
+    check(run["keep_alive_mask"], "heartbeat on a frozen title is still a keep-alive mask")
+
+    stale = _wh.assess_health(
+        records=[_np(8.0, "Old")],
+        now=health_now,
+        alive_mtime_at=health_now - timedelta(minutes=5),
+    )
+    check(stale["stale_content"] and stale["frozen_bar"], "8h same title is both stale and frozen")
+    check(stale["keep_alive_mask"] and not stale["ok"], "fresh watcher_alive cannot mask stale content")
+
+    dead = _wh.assess_health(
+        records=[_np(8.0, "Old")],
+        now=health_now,
+        alive_mtime_at=health_now - timedelta(hours=5),
+    )
+    check(dead["stale_content"] and not dead["keep_alive_mask"], "stale watcher_alive is not a keep-alive mask")
 
     print("self_test failures:", failures)
     return 1 if failures else 0
