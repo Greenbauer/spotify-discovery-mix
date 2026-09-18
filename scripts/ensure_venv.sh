@@ -33,8 +33,14 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 echo "ensure_venv: .venv missing or broken; recreating"
-python3 -m venv --clear "${ROOT}/.venv"
-"$VENV_PY" -m pip install -U pip
+if ! python3 -m venv --clear "${ROOT}/.venv"; then
+  echo "ensure_venv: python3 -m venv failed. On Debian/Ubuntu: apt install python3-venv" >&2
+  exit 1
+fi
+if [[ ! -x "$VENV_PY" ]]; then
+  echo "ensure_venv: venv created but $VENV_PY is missing" >&2
+  exit 1
+fi
 "$VENV_PY" -m pip install -r "$REQ"
 
 if ! venv_ok; then
