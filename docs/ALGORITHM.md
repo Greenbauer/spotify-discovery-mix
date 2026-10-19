@@ -329,8 +329,11 @@ same songs again. Excluded tracks can return in a later mix.
 
 `build_mix` rewrites `last_mix.json` before `publish` runs. If the build
 or the publish fails, `maybe_refresh` restores the previous
-`last_mix.json` (or removes it when there was none), so it keeps matching
-the live playlist and the next hourly run retries.
+`last_mix.json` (or removes it when there was none), so no unpublished
+build is left behind and the next hourly run retries. One case still
+drifts for an hour: the stored playlist was gone, a new one was created,
+and filling it hit a 429. `config.json` then points at the new, empty
+playlist, and the next roll fills it.
 
 `persist_mix` and `publish` refuse to replace a good mix with a much smaller
 one (`MIX_MIN_REPLACE_RATIO` = 0.6) unless `--force`. A rate-limited build
@@ -346,7 +349,7 @@ one-track top-up is the intended write.
 | Sleep-track leakage | Ambient/rain/spa titles in a "popular discovery" mix | Junk filter + stricter resolve + search-rank |
 | ListenBrainz miss | Few similar artists; fallback to seed artists' own unheard hits | Normal; MusicBrainz rate limit is ~1 req/s |
 | Path C lookalikes | Search returns the wrong act | Primary-artist match; still possible if Spotify's first hit is wrong |
-| Dev Mode quota | 429 on search / playlist reads | Short `Retry-After` (<= 60s, delta-seconds or HTTP-date) is waited out. Longer ones raise `SpotifyRateLimited` on playlist and library reads and on every playlist write; the command prints `RATE_LIMITED` and exits 75. Search and similar-artist lookups return nothing on a 429 instead, so the build comes out thin. Library playlists are cached by `snapshot_id` (`state/playlist_cache.json`), so unchanged ones cost no request, and a 429 on a changed one uses its cached copy. With no cached copy it still refuses rather than read the playlist as empty. Thin builds are refused; re-run when quota recovers |
+| Dev Mode quota | 429 on search / playlist reads | Short `Retry-After` (<= 60s, delta-seconds or HTTP-date) is waited out. Longer ones raise `SpotifyRateLimited` on playlist and library reads and on every playlist write; the command prints `RATE_LIMITED` and exits 75. Search and similar-artist lookups return nothing on a 429 instead, so the build comes out smaller. Library playlists are cached by `snapshot_id` (`state/playlist_cache.json`), so unchanged ones cost no request, and a 429 on a changed one uses its cached copy. With no cached copy it still refuses rather than read the playlist as empty. Thin builds are refused; re-run when quota recovers |
 | Unlistened mix | Date added frozen for days; `ROLL noop` every hour; 0/40 heard | `MIX_IDLE_DAYS` rebuild via `maybe_refresh` |
 | Unreadable playlist | Used to look empty and drop excludes | `playlist_items` now raises on non-404 errors |
 | Missing / broken `.venv` | Mix commands fall through to system python; `import requests` fails | `./scripts/ensure_venv.sh` before mix commands |

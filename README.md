@@ -232,7 +232,8 @@ JSON under `state/` is gitignored except `.gitkeep`.
    `RATE_LIMITED ...` and exits `75`; the next hourly run retries. That covers
    playlist and library reads and every playlist write. Search and
    similar-artist lookups that hit a 429 return nothing instead, so the build
-   comes out thin and is refused (see `--force` above).
+   comes out smaller, and is refused if it falls below 60% of the current mix
+   (see `--force` above).
 
 Similar artists use MusicBrainz + ListenBrainz (no key). Last.fm is not used.
 
