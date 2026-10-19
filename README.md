@@ -229,8 +229,10 @@ JSON under `state/` is gitignored except `.gitkeep`.
    the tracks it replaces. A separate Monday `publish` cron is optional now.
 
    A command that Spotify rate-limits (429 with a long `Retry-After`) prints
-   `RATE_LIMITED ...` and exits `75`. Nothing was half-written; the next
-   hourly run retries.
+   `RATE_LIMITED ...` and exits `75`; the next hourly run retries. That covers
+   playlist and library reads and every playlist write. Search and
+   similar-artist lookups that hit a 429 return nothing instead, so the build
+   comes out thin and is refused (see `--force` above).
 
 Similar artists use MusicBrainz + ListenBrainz (no key). Last.fm is not used.
 
@@ -248,7 +250,8 @@ already in one of your playlists or Liked Songs is removed too, with no delay.
 
 A track heard less recently than the delay stays put. If nothing is eligible
 to remove and the playlist is already about `MIX_SIZE`, the command prints
-`ROLL noop` and exits 0. Otherwise it prints
+`ROLL noop` and exits 0. It also prints `ROLL noop` without writing when the
+playlist is short but no new discoveries were found. Otherwise it prints
 `ROLL removed=N kept=K added=A size=S` and writes the playlist with one
 `replace_playlist_tracks` (`/playlists/{id}/items`, fallback `/tracks`).
 

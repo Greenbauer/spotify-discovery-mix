@@ -1580,6 +1580,12 @@ def cmd_publish(paths: Paths, dry_run: bool = False, force: bool = False) -> Non
         created = sp.create_playlist(user["id"], cfg.playlist_name, description, public=False)
         playlist_id = created["id"]
         print(f"created playlist {playlist_id}")
+        # Saved before the fill: if the fill is rate-limited, the next run
+        # reuses this playlist instead of creating another empty one.
+        config.update(
+            {"playlist_id": playlist_id, "playlist_uri": f"spotify:playlist:{playlist_id}"}
+        )
+        write_json(paths.config, config)
     else:
         sp.change_playlist(playlist_id, name=cfg.playlist_name, description=description)
         print(f"updating playlist {playlist_id}")
@@ -1722,6 +1728,10 @@ def cmd_maybe_refresh(
         # blind and the stale playlist stalls again. Put the record back.
         if previous is not None:
             write_json(paths.last_mix, previous)
+        else:
+            # No mix before this run: an unpublished build left here would look
+            # like a fresh, open mix and block the retry for MIX_IDLE_DAYS.
+            paths.last_mix.unlink(missing_ok=True)
         raise
     last = read_json(paths.last_mix, {})
     n = len(last.get("tracks") or [])
@@ -1810,6 +1820,9 @@ def cmd_roll_playlist(
         need=plan.need,
         build_fn=build_fn,
     )
+    if not plan.removed and not new_tracks:
+        print("ROLL noop (short, but no new discoveries to add)")
+        return 0
     uris = assemble_roll_uris(plan.remaining, new_tracks)
     client.replace_playlist_tracks(playlist_id, uris)
 
@@ -2969,6 +2982,41 @@ def cmd_self_test() -> int:
             "a noop roll does not touch rolled_at (the idle clock keeps running)",
         )
 
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        write_json(p.config, {"playlist_id": "pl1", "track_count": 2})
+        write_json(p.last_mix, {"tracks": [], "rolled_at": "2026-09-01T00:00:00+00:00"})
+
+        class _ShortSp:
+            replaced = None
+
+            def playlist_items(self, pid: str) -> list[dict]:
+                return [_trk("A"), _trk("B")]
+
+            def replace_playlist_tracks(self, pid: str, uris: list[str]) -> None:
+                self.replaced = uris
+
+            def me(self) -> dict:
+                return {"id": "u1"}
+
+        short_sp = _ShortSp()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            cmd_roll_playlist(
+                p,
+                sp=short_sp,
+                now=roll_now,
+                build_fn=lambda *a, **k: [],
+                library_fn=lambda: (set(), set()),
+                mix_size=4,
+                delay_min=5,
+            )
+        check(
+            short_sp.replaced is None
+            and read_json(p.last_mix, {}).get("rolled_at") == "2026-09-01T00:00:00+00:00"
+            and "ROLL noop" in out.getvalue(),
+            "a short roll with no discoveries writes nothing and keeps the idle clock",
+        )
+
     check(parse_args(["roll_playlist"]).cmd == "roll_playlist", "roll_playlist is a CLI command")
     check(parse_args(["roll"]).cmd == "roll", "roll is a CLI alias")
 
@@ -3310,6 +3358,16 @@ def cmd_self_test() -> int:
             read_json(p.last_mix, {}) == stale_record,
             "a failed publish restores last_mix (no unpublished build left behind)",
         )
+        p.last_mix.unlink()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_maybe_refresh(p, now=stall_now, build_fn=_fake_build, publish_fn=_publish_429)
+        except SpotifyRateLimited:
+            pass
+        check(
+            not p.last_mix.exists(),
+            "a failed first publish leaves no last_mix, so the next hour bootstraps again",
+        )
 
         # A mix built but never published (build_mix alone) still goes idle.
         write_json(p.last_mix, {"tracks": stall_tracks, "generated_at": "2026-10-08T00:50:00+00:00"})
@@ -3421,6 +3479,34 @@ def cmd_self_test() -> int:
         check(
             pub_sp.created == 0 and read_json(p.config, {})["playlist_id"] == "pl1",
             "a rate-limited publish never creates a duplicate Discovery Mix",
+        )
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        write_json(p.last_mix, {"tracks": [{"id": "T", "uri": "spotify:track:T"}]})
+
+        class _FreshSp:
+            def me(self) -> dict:
+                return {"id": "u1"}
+
+            def create_playlist(self, *a: Any, **k: Any) -> dict:
+                return {"id": "new1"}
+
+            def replace_playlist_tracks(self, pid: str, uris: list[str]) -> None:
+                raise SpotifyRateLimited(f"replace playlist {pid}", 3600)
+
+        real_load_client = load_client
+        globals()["load_client"] = lambda *a, **k: _FreshSp()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_publish(p)
+        except SpotifyRateLimited:
+            pass
+        finally:
+            globals()["load_client"] = real_load_client
+        check(
+            read_json(p.config, {}).get("playlist_id") == "new1",
+            "a created playlist is recorded before a rate-limited fill (no second orphan)",
         )
 
     # 16. Library playlists are cached by snapshot_id; a 429 uses the cache.
