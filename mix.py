@@ -1821,6 +1821,17 @@ def cmd_roll_playlist(
         build_fn=build_fn,
     )
     if not plan.removed and not new_tracks:
+        # Nothing to write. Still sync last_mix to the live playlist (tracks
+        # removed by hand) so heard ratios count only what is really there.
+        persist_rolled_mix(
+            paths,
+            remaining=plan.remaining,
+            new_tracks=[],
+            user_id=config.get("user_id") or "",
+            cfg=cfg,
+            playlist_id=playlist_id,
+            changed=False,
+        )
         print("ROLL noop (short, but no new discoveries to add)")
         return 0
     uris = assemble_roll_uris(plan.remaining, new_tracks)
@@ -2016,8 +2027,14 @@ def persist_rolled_mix(
     user_id: str,
     cfg: MixConfig,
     playlist_id: str,
+    changed: bool = True,
 ) -> dict:
-    """Rewrite last_mix.tracks to the rolled playlist. Keep week / published_at."""
+    """Rewrite last_mix.tracks to the rolled playlist. Keep week / published_at.
+
+    changed=False syncs the record to the live playlist without stamping
+    rolled_at / generated_at: nothing was written to Spotify, so the idle
+    clock must keep running.
+    """
     last = read_json(paths.last_mix, {})
     prev_by_id = {t.get("id"): t for t in (last.get("tracks") or []) if t.get("id")}
     tracks = [_spotify_track_record(t, prev_by_id.get(t.get("id"))) for t in remaining]
@@ -2037,14 +2054,14 @@ def persist_rolled_mix(
         last["week"] = cfg.today.isocalendar()[:2]
     last.update(
         {
-            "generated_at": now,
             "user_id": user_id,
             "playlist_name": cfg.playlist_name,
             "playlist_id": playlist_id,
-            "rolled_at": now,
             "tracks": tracks,
         }
     )
+    if changed:
+        last.update({"generated_at": now, "rolled_at": now})
     if not last.get("rules"):
         last["rules"] = {
             "size": cfg.size,
@@ -3013,8 +3030,13 @@ def cmd_self_test() -> int:
         check(
             short_sp.replaced is None
             and read_json(p.last_mix, {}).get("rolled_at") == "2026-09-01T00:00:00+00:00"
+            and "generated_at" not in read_json(p.last_mix, {})
             and "ROLL noop" in out.getvalue(),
             "a short roll with no discoveries writes nothing and keeps the idle clock",
+        )
+        check(
+            [t["id"] for t in read_json(p.last_mix, {})["tracks"]] == ["A", "B"],
+            "that noop still syncs last_mix to the live playlist (hand-removed tracks drop)",
         )
 
     check(parse_args(["roll_playlist"]).cmd == "roll_playlist", "roll_playlist is a CLI command")
@@ -3369,6 +3391,27 @@ def cmd_self_test() -> int:
             "a failed first publish leaves no last_mix, so the next hour bootstraps again",
         )
 
+        # The documented env overrides are what mix_heard_progress reads.
+        write_json(p.last_mix, stale_record)
+        saved_env = {k: os.environ.get(k) for k in ("MIX_IDLE_DAYS", "MIX_MAX_AGE_DAYS")}
+        os.environ.update({"MIX_IDLE_DAYS": "20", "MIX_MAX_AGE_DAYS": "20"})
+        try:
+            check(
+                not mix_heard_progress(p, now=stall_now)["finished"],
+                "MIX_IDLE_DAYS / MIX_MAX_AGE_DAYS env overrides are honored",
+            )
+            os.environ["MIX_IDLE_DAYS"] = "2"
+            check(
+                "idle" in (mix_heard_progress(p, now=stall_now)["finished_reason"] or ""),
+                "a lower MIX_IDLE_DAYS fires the idle rule",
+            )
+        finally:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
         # A mix built but never published (build_mix alone) still goes idle.
         write_json(p.last_mix, {"tracks": stall_tracks, "generated_at": "2026-10-08T00:50:00+00:00"})
         check(
@@ -3655,7 +3698,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-# EX_TEMPFAIL: Spotify rate-limited this run before it wrote anything. Retry later.
+# EX_TEMPFAIL: Spotify rate-limited this run. State files stay consistent
+# (maybe_refresh restores last_mix); the next hourly run retries.
 EXIT_RATE_LIMITED = 75
 
 

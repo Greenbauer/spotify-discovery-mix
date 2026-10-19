@@ -247,6 +247,8 @@ filters, primary-only seeds, and National Forest resolve all still apply.
    `MIX_SIZE`, print `ROLL noop` and exit 0. A short playlist with no new
    discoveries to add is also a `ROLL noop` with no write. A write would
    change nothing but reset `rolled_at`, and the idle clock would never fire.
+   `last_mix.json` is still synced to the live playlist (without new stamps),
+   so tracks removed by hand stop counting toward the heard ratio.
 
 `roll_playlist` does **not** ping the user and does **not** call
 currently-playing in a loop. Detection is a separate step.
