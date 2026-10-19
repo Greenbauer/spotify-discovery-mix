@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import email.utils
 import importlib.util
 import io
 import json
@@ -72,7 +73,13 @@ MIX_MIN_REPLACE_RATIO = 0.6
 # maybe_refresh's escape hatches. "Every track heard" alone wedges forever on a
 # single track that is region-locked, removed, or relinked to another id.
 MIX_HEARD_RATIO = 0.9
-MIX_MAX_AGE_DAYS = 14
+# Time-based escapes (defaults; env MIX_MAX_AGE_DAYS / MIX_IDLE_DAYS override).
+# Rolling only moves when tracks are heard, so an unlistened mix used to sit
+# frozen until an external Monday publish ran (2026-10-08 to 10-19 stall).
+#   age:  days since publish. The weekly rebuild, with or without a Monday cron.
+#   idle: days since the playlist last CHANGED (a publish or a roll that wrote).
+MIX_MAX_AGE_DAYS = 7
+MIX_IDLE_DAYS = 3
 
 SCOPES = [
     "playlist-read-private",
@@ -387,10 +394,49 @@ class Paths:
     def similar_cache(self) -> Path:
         return self.state / "similar_cache.json"
 
+    @property
+    def playlist_cache(self) -> Path:
+        return self.state / "playlist_cache.json"
+
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
+
+def retry_after_seconds(raw: str | None) -> float | None:
+    """Seconds to wait from a Retry-After header, or None if it is unusable.
+
+    The header is either delta-seconds or an HTTP-date (RFC 9110). A plain
+    float() crashed the whole run on the date form.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+class SpotifyRateLimited(RuntimeError):
+    """Spotify answered 429 and the wait was too long (or too often) to sit out.
+
+    A RuntimeError, so existing `except RuntimeError` callers keep working; the
+    message keeps "429" for watch_plays' quota back-off.
+    """
+
+    def __init__(self, what: str, retry_after: float | None = None) -> None:
+        self.retry_after = retry_after
+        hint = f" (Retry-After {retry_after:.0f}s)" if retry_after is not None else ""
+        super().__init__(f"{what} -> 429 rate limited{hint}")
+
 
 class Http:
     def __init__(self, user_agent: str = UA, min_interval: float = 0.0) -> None:
@@ -409,6 +455,7 @@ class Http:
     ) -> requests.Response:
         kwargs.setdefault("timeout", 30)
         last_exc: Exception | None = None
+        last_429: requests.Response | None = None
         for attempt in range(retries):
             gap = self.min_interval - (time.monotonic() - self._last)
             if gap > 0:
@@ -421,19 +468,25 @@ class Http:
                 continue
             self._last = time.monotonic()
             if resp.status_code == 429:
-                wait = resp.headers.get("Retry-After")
-                wait_s = float(wait) if wait else min(16.0, 1.0 * 2**attempt)
+                wait_s = retry_after_seconds(resp.headers.get("Retry-After"))
+                if wait_s is None:
+                    wait_s = min(16.0, 1.0 * 2**attempt)
                 # Spotify Dev Mode can return Retry-After of many hours for
                 # QUOTA_EXCEEDED. Sleeping that long wedges watch_plays; return
                 # the 429 so callers can degrade (e.g. skip recently-played).
                 if wait_s > 60:
                     return resp
+                last_429 = resp
                 time.sleep(wait_s)
                 continue
             if resp.status_code in {500, 502, 503, 504}:
                 time.sleep(min(8.0, 0.5 * 2**attempt))
                 continue
             return resp
+        if last_429 is not None:
+            # Still limited after every short wait: hand back the 429 itself so
+            # callers see a rate limit, not a generic "failed after retries".
+            return last_429
         if last_exc:
             raise last_exc
         raise RuntimeError(f"HTTP {method} {url} failed after retries")
@@ -483,12 +536,21 @@ class Spotify:
 
     def _get(self, path: str, params: dict | None = None) -> Any:
         resp = self._request("GET", path, params=params)
+        if resp.status_code == 429:
+            raise SpotifyRateLimited(
+                f"GET {path}", retry_after_seconds(resp.headers.get("Retry-After"))
+            )
         if resp.status_code >= 400:
             raise RuntimeError(f"GET {path} -> {resp.status_code}: {resp.text[:400]}")
         return resp.json()
 
     def _send(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         return self._request(method, path, **kwargs)
+
+    @staticmethod
+    def _raise_if_limited(resp: requests.Response, what: str) -> None:
+        if resp.status_code == 429:
+            raise SpotifyRateLimited(what, retry_after_seconds(resp.headers.get("Retry-After")))
 
     def get_ok(self, path: str, params: dict | None = None) -> tuple[int, Any]:
         resp = self._request("GET", path, params=params)
@@ -538,22 +600,30 @@ class Spotify:
         like an empty one: its track ids would drop out of the exclude set and
         songs already in your library would be published back as discoveries.
         404 alone means "wrong path shape for this API version" — keep trying.
+        A 429 raises SpotifyRateLimited so Mixer.collect_library can fall back
+        to its cached copy instead of failing the whole run.
         """
         tracks: list[dict] = []
         suffixes = list(dict.fromkeys([self.caps.playlist_items_path, "items", "tracks"]))
         for suffix in suffixes:
-            code, body = self.get_ok(
-                f"/playlists/{playlist_id}/{suffix}",
-                {"limit": 50},
+            resp = self._request(
+                "GET", f"/playlists/{playlist_id}/{suffix}", params={"limit": 50}
             )
+            code = resp.status_code
             if code == 404:
                 continue
+            if code == 429:
+                raise SpotifyRateLimited(
+                    f"playlist {playlist_id}",
+                    retry_after_seconds(resp.headers.get("Retry-After")),
+                )
             if code >= 400:
                 raise RuntimeError(
                     f"playlist {playlist_id} /{suffix} -> {code}. Refusing to treat "
                     f"an unreadable playlist as empty."
                 )
             self.caps.playlist_items_path = suffix
+            body = resp.json()
             items = list(body.get("items") or [])
             nxt = body.get("next")
             while nxt and nxt.startswith(SPOTIFY_API):
@@ -647,14 +717,17 @@ class Spotify:
     def create_playlist(self, user_id: str, name: str, description: str, public: bool = False) -> dict:
         payload = {"name": name, "description": description, "public": public}
         resp = self._send("POST", "/me/playlists", json=payload)
+        self._raise_if_limited(resp, "create playlist")
         if resp.status_code >= 400:
             resp = self._send("POST", f"/users/{user_id}/playlists", json=payload)
+            self._raise_if_limited(resp, "create playlist")
         if resp.status_code >= 400:
             raise RuntimeError(f"create playlist -> {resp.status_code}: {resp.text[:400]}")
         return resp.json()
 
     def change_playlist(self, playlist_id: str, **fields: Any) -> None:
         resp = self._send("PUT", f"/playlists/{playlist_id}", json=fields)
+        self._raise_if_limited(resp, f"change playlist {playlist_id}")
         if resp.status_code >= 400:
             raise RuntimeError(f"change playlist -> {resp.status_code}: {resp.text[:400]}")
 
@@ -662,6 +735,7 @@ class Spotify:
         body = {"uris": uris}
         for suffix in (self.caps.playlist_items_path, "items", "tracks"):
             resp = self._send("PUT", f"/playlists/{playlist_id}/{suffix}", json=body)
+            self._raise_if_limited(resp, f"replace playlist {playlist_id}")
             if resp.status_code < 400:
                 self.caps.playlist_items_path = suffix
                 return
@@ -693,6 +767,18 @@ class Spotify:
                     pop = items[0].get("popularity")
         self.caps.popularity_field = pop is not None
         return self.caps
+
+
+def _cacheable_track(track: dict) -> dict:
+    """The fields collect_library uses (id, title, artists). Drops markets etc."""
+    return {
+        "id": track.get("id"),
+        "uri": track.get("uri"),
+        "name": track.get("name"),
+        "artists": [
+            {"id": a.get("id"), "name": a.get("name")} for a in (track.get("artists") or [])
+        ],
+    }
 
 
 def _playlist_item_track(raw: dict) -> dict | None:
@@ -948,6 +1034,11 @@ class Mixer:
         skipped_seeding: list[str] = []
         owned: list[dict] = []
 
+        cache = read_json(self.paths.playlist_cache, {})
+        if not isinstance(cache, dict):
+            cache = {}
+        next_cache: dict[str, Any] = {}
+
         print(f"created playlists: {len(created)}")
         for pl in created:
             name = pl.get("name") or ""
@@ -955,7 +1046,7 @@ class Mixer:
                 print(f"  skip entirely: {name!r} (our own output)")
                 continue
 
-            tracks = self.sp.playlist_items(pl["id"])
+            tracks = self._playlist_tracks_cached(pl, cache, next_cache)
             owned.extend(tracks)
             for t in tracks:
                 if t.get("id"):
@@ -971,6 +1062,9 @@ class Mixer:
             print(f"  {name!r}: {len(tracks)} tracks (seeds + excludes)")
             for t in tracks:
                 self._count_primary_seed(seed_artist_names, t)
+
+        # Only playlists still in your library are kept, so deleted ones age out.
+        write_json(self.paths.playlist_cache, next_cache)
 
         # Likes are always excludes ("likes = seeds + exclude" per the README);
         # MIX_USE_LIKES only decides whether they also seed.
@@ -995,6 +1089,37 @@ class Mixer:
         exclude |= self.played_ids()
         print(f"exclude track ids: {len(exclude)}")
         return seed_playlists, exclude, seed_artist_names
+
+    def _playlist_tracks_cached(
+        self, pl: dict, cache: dict, next_cache: dict
+    ) -> list[dict]:
+        """One created playlist's tracks, re-read only when its snapshot_id moved.
+
+        roll_playlist reads the whole library every hour; re-reading unchanged
+        playlists is most of the request volume that trips Dev Mode 429s.
+        On a 429 the last cached copy is used: real tracks, possibly missing
+        the newest adds (the next roll's owned check catches those). It is
+        never an empty list. With nothing cached the 429 propagates.
+        """
+        pid = pl["id"]
+        snap = pl.get("snapshot_id")
+        hit = cache.get(pid)
+        if not isinstance(hit, dict):
+            hit = None
+        if hit and snap and hit.get("snapshot_id") == snap:
+            next_cache[pid] = hit
+            return list(hit.get("tracks") or [])
+        try:
+            tracks = [_cacheable_track(t) for t in self.sp.playlist_items(pid)]
+        except SpotifyRateLimited as exc:
+            if hit is None:
+                raise
+            print(f"  {pl.get('name')!r}: {exc}; using the cached copy")
+            # Keep the OLD snapshot so the next run re-reads it.
+            next_cache[pid] = hit
+            return list(hit.get("tracks") or [])
+        next_cache[pid] = {"snapshot_id": snap, "tracks": tracks}
+        return tracks
 
     @staticmethod
     def _count_primary_seed(dest: Counter, track: dict) -> None:
@@ -1377,12 +1502,17 @@ def mix_config_from_env(today: date | None = None) -> MixConfig:
     )
 
 
-def cmd_build_mix(paths: Paths, persist: bool = True, force: bool = False) -> list[Candidate]:
+def cmd_build_mix(
+    paths: Paths,
+    persist: bool = True,
+    force: bool = False,
+    extra_exclude: set[str] | None = None,
+) -> list[Candidate]:
     sp = load_client()
     cfg = mix_config_from_env()
     mixer = Mixer(sp, paths, cfg)
     user = sp.me()
-    tracks = mixer.build(user)
+    tracks = mixer.build(user, extra_exclude=extra_exclude)
     if persist:
         mixer.persist_mix(tracks, user["id"], force=force)
         print(f"wrote {paths.last_mix}")
@@ -1434,6 +1564,10 @@ def cmd_publish(paths: Paths, dry_run: bool = False, force: bool = False) -> Non
     if playlist_id:
         # confirm it still exists / is ours
         code, body = sp.get_ok(f"/playlists/{playlist_id}")
+        if code == 429:
+            # Not "gone": creating a new one here leaves a duplicate Discovery
+            # Mix and orphans the playlist the user follows.
+            raise SpotifyRateLimited(f"playlist {playlist_id} lookup")
         if code >= 400:
             print(f"stored playlist {playlist_id} not reachable ({code}); creating a new one")
             playlist_id = None
@@ -1446,6 +1580,12 @@ def cmd_publish(paths: Paths, dry_run: bool = False, force: bool = False) -> Non
         created = sp.create_playlist(user["id"], cfg.playlist_name, description, public=False)
         playlist_id = created["id"]
         print(f"created playlist {playlist_id}")
+        # Saved before the fill: if the fill is rate-limited, the next run
+        # reuses this playlist instead of creating another empty one.
+        config.update(
+            {"playlist_id": playlist_id, "playlist_uri": f"spotify:playlist:{playlist_id}"}
+        )
+        write_json(paths.config, config)
     else:
         sp.change_playlist(playlist_id, name=cfg.playlist_name, description=description)
         print(f"updating playlist {playlist_id}")
@@ -1468,7 +1608,7 @@ def cmd_publish(paths: Paths, dry_run: bool = False, force: bool = False) -> Non
     print(f"published {len(uris)} tracks → {config['playlist_uri']}")
 
 
-def _age_days(stamp: str | None) -> float | None:
+def _age_days(stamp: str | None, now: datetime | None = None) -> float | None:
     if not stamp:
         return None
     try:
@@ -1477,16 +1617,28 @@ def _age_days(stamp: str | None) -> float | None:
         return None
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - when).total_seconds() / 86400.0
+    now = now or datetime.now(timezone.utc)
+    return (now - when).total_seconds() / 86400.0
 
 
-def mix_heard_progress(paths: Paths) -> dict:
+def mix_heard_progress(
+    paths: Paths,
+    *,
+    now: datetime | None = None,
+    max_age_days: int | None = None,
+    idle_days: int | None = None,
+) -> dict:
     """How much of this week's mix has been heard, and may it be replaced yet.
 
     "Finished" is not "every track heard": one region-locked, removed, or
     relinked track would wedge maybe_refresh permanently. A mix also counts as
-    finished once MIX_HEARD_RATIO of it is heard, or once it is simply old.
+    finished once MIX_HEARD_RATIO of it is heard, once it is old (published
+    max_age_days ago), or once it is idle: no publish and no roll has changed
+    the playlist for idle_days. Idle is the 0/N-heard case. Rolling only
+    advances on hears, so without it an unlistened mix never moves.
     """
+    max_age = env_int("MIX_MAX_AGE_DAYS", MIX_MAX_AGE_DAYS) if max_age_days is None else max_age_days
+    idle_limit = env_int("MIX_IDLE_DAYS", MIX_IDLE_DAYS) if idle_days is None else idle_days
     last = read_json(paths.last_mix, {})
     tracks = [t for t in (last.get("tracks") or []) if t.get("id")]
     mix_ids = {t["id"] for t in tracks}
@@ -1494,7 +1646,14 @@ def mix_heard_progress(paths: Paths) -> dict:
     heard = _heard_ids(played) & mix_ids
     missing = [t for t in tracks if t["id"] not in heard]
     ratio = (len(heard) / len(mix_ids)) if mix_ids else 0.0
-    age = _age_days(last.get("published_at"))
+    age = _age_days(last.get("published_at"), now)
+    # rolled_at is only written by a roll that changed the playlist; a noop
+    # roll leaves it alone, so this measures time since the last real change.
+    # generated_at covers a build_mix that never got published: without it a
+    # record with no publish or roll stamp would never go idle.
+    stamps = (last.get("rolled_at"), last.get("generated_at"))
+    changes = [a for a in (age, *(_age_days(t, now) for t in stamps)) if a is not None]
+    idle = min(changes) if changes else None
 
     reason = None
     if mix_ids:
@@ -1502,8 +1661,10 @@ def mix_heard_progress(paths: Paths) -> dict:
             reason = "all heard"
         elif ratio >= MIX_HEARD_RATIO:
             reason = f"{ratio:.0%} heard (>= {MIX_HEARD_RATIO:.0%})"
-        elif age is not None and age >= MIX_MAX_AGE_DAYS:
-            reason = f"published {age:.0f}d ago (>= {MIX_MAX_AGE_DAYS}d)"
+        elif age is not None and age >= max_age:
+            reason = f"published {age:.1f}d ago (>= {max_age}d)"
+        elif idle is not None and idle >= idle_limit:
+            reason = f"unchanged for {idle:.1f}d (>= {idle_limit}d idle)"
 
     return {
         "mix_size": len(mix_ids),
@@ -1511,6 +1672,7 @@ def mix_heard_progress(paths: Paths) -> dict:
         "remaining": len(missing),
         "heard_ratio": ratio,
         "age_days": age,
+        "idle_days": idle,
         "finished": reason is not None,
         "finished_reason": reason,
         "published_at": last.get("published_at"),
@@ -1519,15 +1681,30 @@ def mix_heard_progress(paths: Paths) -> dict:
     }
 
 
-def cmd_maybe_refresh(paths: Paths) -> int:
+def cmd_maybe_refresh(
+    paths: Paths,
+    *,
+    now: datetime | None = None,
+    build_fn: Any = None,
+    publish_fn: Any = None,
+) -> int:
     """If this week's mix is used up, build and publish a replacement.
 
     Prints MIX_FINISHED then NEW_MIX so callers know to ping Zach.
-    "Used up" is all-heard, mostly-heard, or simply old — see
-    mix_heard_progress. With no mix at all, bootstraps one rather than
+    "Used up" is all-heard, mostly-heard, old, or idle (see
+    mix_heard_progress). With no mix at all, bootstraps one rather than
     no-opping forever.
+
+    The replacement excludes every track of the mix it replaces. The build RNG
+    is week-stable and unheard tracks are not in the play log, so an idle
+    refresh inside the same ISO week would otherwise republish the same songs.
+
+    `build_fn(paths, extra_exclude=...)` and `publish_fn(paths)` are injectable
+    for tests; they default to cmd_build_mix and cmd_publish.
     """
-    prog = mix_heard_progress(paths)
+    build_fn = build_fn or cmd_build_mix
+    publish_fn = publish_fn or cmd_publish
+    prog = mix_heard_progress(paths, now=now)
     print(
         f"mix progress: {prog['heard']}/{prog['mix_size']} heard, "
         f"{prog['remaining']} remaining"
@@ -1539,8 +1716,23 @@ def cmd_maybe_refresh(paths: Paths) -> int:
         return 0
     else:
         print(f"MIX_FINISHED ({prog['finished_reason']})")
-    cmd_build_mix(paths)
-    cmd_publish(paths)
+
+    previous = read_json(paths.last_mix, None)
+    try:
+        build_fn(paths, extra_exclude=_mix_track_ids(paths))
+        publish_fn(paths)
+    except BaseException:
+        # build_mix rewrites last_mix.json before publish runs. If publish then
+        # fails (a 429 on the write), last_mix would describe tracks that never
+        # reached Spotify, with no published_at: the age and idle clocks go
+        # blind and the stale playlist stalls again. Put the record back.
+        if previous is not None:
+            write_json(paths.last_mix, previous)
+        else:
+            # No mix before this run: an unpublished build left here would look
+            # like a fresh, open mix and block the retry for MIX_IDLE_DAYS.
+            paths.last_mix.unlink(missing_ok=True)
+        raise
     last = read_json(paths.last_mix, {})
     n = len(last.get("tracks") or [])
     print(f"NEW_MIX {n}")
@@ -1628,6 +1820,20 @@ def cmd_roll_playlist(
         need=plan.need,
         build_fn=build_fn,
     )
+    if not plan.removed and not new_tracks:
+        # Nothing to write. Still sync last_mix to the live playlist (tracks
+        # removed by hand) so heard ratios count only what is really there.
+        persist_rolled_mix(
+            paths,
+            remaining=plan.remaining,
+            new_tracks=[],
+            user_id=config.get("user_id") or "",
+            cfg=cfg,
+            playlist_id=playlist_id,
+            changed=False,
+        )
+        print("ROLL noop (short, but no new discoveries to add)")
+        return 0
     uris = assemble_roll_uris(plan.remaining, new_tracks)
     client.replace_playlist_tracks(playlist_id, uris)
 
@@ -1821,8 +2027,14 @@ def persist_rolled_mix(
     user_id: str,
     cfg: MixConfig,
     playlist_id: str,
+    changed: bool = True,
 ) -> dict:
-    """Rewrite last_mix.tracks to the rolled playlist. Keep week / published_at."""
+    """Rewrite last_mix.tracks to the rolled playlist. Keep week / published_at.
+
+    changed=False syncs the record to the live playlist without stamping
+    rolled_at / generated_at: nothing was written to Spotify, so the idle
+    clock must keep running.
+    """
     last = read_json(paths.last_mix, {})
     prev_by_id = {t.get("id"): t for t in (last.get("tracks") or []) if t.get("id")}
     tracks = [_spotify_track_record(t, prev_by_id.get(t.get("id"))) for t in remaining]
@@ -1842,14 +2054,14 @@ def persist_rolled_mix(
         last["week"] = cfg.today.isocalendar()[:2]
     last.update(
         {
-            "generated_at": now,
             "user_id": user_id,
             "playlist_name": cfg.playlist_name,
             "playlist_id": playlist_id,
-            "rolled_at": now,
             "tracks": tracks,
         }
     )
+    if changed:
+        last.update({"generated_at": now, "rolled_at": now})
     if not last.get("rules"):
         last["rules"] = {
             "size": cfg.size,
@@ -2345,7 +2557,10 @@ def cmd_self_test() -> int:
             p.last_mix,
             {"tracks": [{"id": f"T{i}"} for i in range(40)], "published_at": old},
         )
-        check(mix_heard_progress(p)["finished"], "an old mix ages out even if unheard")
+        check(
+            mix_heard_progress(p, max_age_days=MIX_MAX_AGE_DAYS)["finished"],
+            "an old mix ages out even if unheard",
+        )
 
     # 4. Skipping a playlist for SEEDING still contributes its excludes.
     class _FakeSp:
@@ -2759,6 +2974,7 @@ def cmd_self_test() -> int:
                 return full_four
 
         noop_sp = _NoopSp()
+        rolled_before = read_json(p.last_mix, {}).get("rolled_at")
         built = []
 
         def _no_build(*_a, **_k):
@@ -2777,6 +2993,50 @@ def cmd_self_test() -> int:
         check(
             rc == 0 and noop_sp.replaced is None and not built,
             "noop skips replace and discovery",
+        )
+        check(
+            rolled_before and read_json(p.last_mix, {}).get("rolled_at") == rolled_before,
+            "a noop roll does not touch rolled_at (the idle clock keeps running)",
+        )
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        write_json(p.config, {"playlist_id": "pl1", "track_count": 2})
+        write_json(p.last_mix, {"tracks": [], "rolled_at": "2026-09-01T00:00:00+00:00"})
+
+        class _ShortSp:
+            replaced = None
+
+            def playlist_items(self, pid: str) -> list[dict]:
+                return [_trk("A"), _trk("B")]
+
+            def replace_playlist_tracks(self, pid: str, uris: list[str]) -> None:
+                self.replaced = uris
+
+            def me(self) -> dict:
+                return {"id": "u1"}
+
+        short_sp = _ShortSp()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            cmd_roll_playlist(
+                p,
+                sp=short_sp,
+                now=roll_now,
+                build_fn=lambda *a, **k: [],
+                library_fn=lambda: (set(), set()),
+                mix_size=4,
+                delay_min=5,
+            )
+        check(
+            short_sp.replaced is None
+            and read_json(p.last_mix, {}).get("rolled_at") == "2026-09-01T00:00:00+00:00"
+            and "generated_at" not in read_json(p.last_mix, {})
+            and "ROLL noop" in out.getvalue(),
+            "a short roll with no discoveries writes nothing and keeps the idle clock",
+        )
+        check(
+            [t["id"] for t in read_json(p.last_mix, {})["tracks"]] == ["A", "B"],
+            "that noop still syncs last_mix to the live playlist (hand-removed tracks drop)",
         )
 
     check(parse_args(["roll_playlist"]).cmd == "roll_playlist", "roll_playlist is a CLI command")
@@ -2940,6 +3200,12 @@ def cmd_self_test() -> int:
             "build skips a song you own under a different release id",
         )
         check("LIKED_ALBUM_holdon" in mx.owned_ids, "owned ids exclude the heard log")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rebuilt = Mixer.build(mx, {"id": "u1"}, extra_exclude={"NEW_song"}, target_size=5)
+        check(
+            "NEW_song" not in [c.track_id for c in rebuilt],
+            "the real build drops extra_exclude ids (maybe_refresh's stale-mix exclusion)",
+        )
 
     # 13. Skip-logger health: watcher_alive can be fresh while nowplaying.jsonl
     #     is stale or frozen on one title. No network; synthetic log rows.
@@ -3004,6 +3270,367 @@ def cmd_self_test() -> int:
     )
     check(dead["stale_content"] and not dead["keep_alive_mask"], "stale watcher_alive is not a keep-alive mask")
 
+    # 14. The 2026-10-08 → 10-19 stall: an unheard mix must refresh on its own.
+    #     Rolling only moves on hears; with the Monday publish paused the mix
+    #     sat frozen 11 days because the only time escape was 14 days.
+    stall_now = datetime(2026, 10, 19, 14, 54, tzinfo=timezone.utc)
+    stall_tracks = [{"id": f"S{i}", "name": f"s{i}"} for i in range(40)]
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        write_json(p.played, {"plays": []})
+        write_json(
+            p.last_mix,
+            {
+                "tracks": stall_tracks,
+                "published_at": "2026-10-08T00:54:26+00:00",
+                "rolled_at": "2026-10-08T01:39:13+00:00",
+            },
+        )
+        # Hold the age cap far out so this proves the idle rule on its own.
+        prog = mix_heard_progress(p, now=stall_now, max_age_days=30, idle_days=3)
+        check(
+            prog["heard"] == 0 and prog["finished"],
+            "the Oct 8 mix (0/40 heard, 11d unchanged) is finished",
+        )
+        check("idle" in (prog["finished_reason"] or ""), "the stall finishes by the idle rule")
+        prog = mix_heard_progress(p, now=stall_now, max_age_days=7, idle_days=30)
+        check(
+            prog["finished"] and "published" in (prog["finished_reason"] or ""),
+            "the 7-day age cap alone also catches it (no Monday cron needed)",
+        )
+
+        # A roll that wrote yesterday resets the idle clock, not the age clock.
+        write_json(
+            p.last_mix,
+            {
+                "tracks": stall_tracks,
+                "published_at": "2026-10-14T00:00:00+00:00",
+                "rolled_at": "2026-10-18T12:00:00+00:00",
+            },
+        )
+        check(
+            not mix_heard_progress(p, now=stall_now, max_age_days=7, idle_days=3)["finished"],
+            "a recent roll keeps an otherwise-unheard mix open",
+        )
+        check(
+            mix_heard_progress(p, now=stall_now, max_age_days=5, idle_days=3)["finished"],
+            "rolling does not postpone the weekly age rebuild",
+        )
+        check(
+            not mix_heard_progress(p, now=stall_now, max_age_days=30, idle_days=3)["finished"]
+            and mix_heard_progress(p, now=stall_now + timedelta(days=3), max_age_days=30, idle_days=3)["finished"],
+            "idle counts from the last change, not from publish",
+        )
+
+        # maybe_refresh: a stale refresh excludes the mix it replaces (the RNG is
+        # week-stable, so same-week rebuilds would otherwise repeat it) ...
+        write_json(
+            p.last_mix,
+            {
+                "tracks": stall_tracks,
+                "published_at": "2026-10-08T00:54:26+00:00",
+                "rolled_at": "2026-10-08T01:39:13+00:00",
+            },
+        )
+        seen_exclude: list[set] = []
+
+        def _fake_build(paths: Paths, extra_exclude: set | None = None) -> None:
+            seen_exclude.append(set(extra_exclude or ()))
+            write_json(paths.last_mix, {"tracks": [{"id": f"F{i}"} for i in range(40)]})
+
+        def _fake_publish(paths: Paths) -> None:
+            last = read_json(paths.last_mix, {})
+            last["published_at"] = stall_now.isoformat()
+            write_json(paths.last_mix, last)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = cmd_maybe_refresh(p, now=stall_now, build_fn=_fake_build, publish_fn=_fake_publish)
+        check(rc == 0 and "MIX_FINISHED" in out.getvalue(), "maybe_refresh fires on the stalled mix")
+        check(
+            seen_exclude and seen_exclude[0] == {t["id"] for t in stall_tracks},
+            "the replacement build excludes every track of the stale mix",
+        )
+        check(
+            read_json(p.last_mix, {}).get("published_at") == stall_now.isoformat(),
+            "a successful refresh restarts the clocks",
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            cmd_maybe_refresh(p, now=stall_now, build_fn=_fake_build, publish_fn=_fake_publish)
+        check("mix still open" in out.getvalue(), "a fresh mix is left alone")
+
+        # ... and a publish failure puts last_mix back, so the clocks still see
+        # the stale playlist and the next hourly run retries.
+        stale_record = {
+            "tracks": stall_tracks,
+            "published_at": "2026-10-08T00:54:26+00:00",
+            "rolled_at": "2026-10-08T01:39:13+00:00",
+        }
+        write_json(p.last_mix, stale_record)
+
+        def _publish_429(paths: Paths) -> None:
+            raise SpotifyRateLimited("PUT /playlists/x/items", 3600)
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_maybe_refresh(p, now=stall_now, build_fn=_fake_build, publish_fn=_publish_429)
+            check(False, "a failed publish propagates")
+        except SpotifyRateLimited:
+            check(True, "a failed publish propagates")
+        check(
+            read_json(p.last_mix, {}) == stale_record,
+            "a failed publish restores last_mix (no unpublished build left behind)",
+        )
+        p.last_mix.unlink()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_maybe_refresh(p, now=stall_now, build_fn=_fake_build, publish_fn=_publish_429)
+        except SpotifyRateLimited:
+            pass
+        check(
+            not p.last_mix.exists(),
+            "a failed first publish leaves no last_mix, so the next hour bootstraps again",
+        )
+
+        # The documented env overrides are what mix_heard_progress reads.
+        write_json(p.last_mix, stale_record)
+        saved_env = {k: os.environ.get(k) for k in ("MIX_IDLE_DAYS", "MIX_MAX_AGE_DAYS")}
+        os.environ.update({"MIX_IDLE_DAYS": "20", "MIX_MAX_AGE_DAYS": "20"})
+        try:
+            check(
+                not mix_heard_progress(p, now=stall_now)["finished"],
+                "MIX_IDLE_DAYS / MIX_MAX_AGE_DAYS env overrides are honored",
+            )
+            os.environ["MIX_IDLE_DAYS"] = "2"
+            check(
+                "idle" in (mix_heard_progress(p, now=stall_now)["finished_reason"] or ""),
+                "a lower MIX_IDLE_DAYS fires the idle rule",
+            )
+        finally:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        # A mix built but never published (build_mix alone) still goes idle.
+        write_json(p.last_mix, {"tracks": stall_tracks, "generated_at": "2026-10-08T00:50:00+00:00"})
+        check(
+            mix_heard_progress(p, now=stall_now, max_age_days=7, idle_days=3)["finished"],
+            "an unpublished build with no publish/roll stamp still ages out by idle",
+        )
+
+    # 15. Spotify 429s on reads: parse Retry-After safely, surface a real 429.
+    check(retry_after_seconds("7") == 7.0, "Retry-After delta-seconds parses")
+    check(retry_after_seconds(None) is None and retry_after_seconds("soon") is None, "bad Retry-After is None")
+    future = (datetime.now(timezone.utc) + timedelta(hours=2)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    ra = retry_after_seconds(future)
+    check(ra is not None and 7000 < ra <= 7200, "Retry-After HTTP-date parses instead of crashing")
+
+    class _LimitedSession:
+        """Always 429 with the given Retry-After."""
+
+        def __init__(self, retry_after: str) -> None:
+            self.headers: dict = {}
+            self.calls = 0
+            self.retry_after = retry_after
+
+        def request(self, method: str, url: str, **kw: Any) -> Any:
+            self.calls += 1
+            r = _Resp(429, {"error": {"status": 429}})
+            r.headers = {"Retry-After": self.retry_after}
+            return r
+
+    sp429 = Spotify("t")
+    sp429.http.s = _LimitedSession("0")
+    resp = sp429.http.request("GET", "https://x/y", retries=3)
+    check(resp.status_code == 429 and sp429.http.s.calls == 3, "short 429s retry, then return the 429 itself")
+    sp429.http.s = _LimitedSession("86400")
+    try:
+        sp429.playlist_items("p1")
+        check(False, "a long 429 on a playlist read raises SpotifyRateLimited")
+    except SpotifyRateLimited as exc:
+        check(exc.retry_after == 86400.0, "a long 429 on a playlist read raises SpotifyRateLimited")
+    check(sp429.http.s.calls == 1, "a quota-length Retry-After is not slept through")
+    try:
+        sp429._get("/me/tracks")
+        check(False, "a 429 on a paged read raises SpotifyRateLimited")
+    except SpotifyRateLimited:
+        check(True, "a 429 on a paged read raises SpotifyRateLimited")
+    real_dispatch = _dispatch
+
+    def _limited_dispatch(argv: list[str] | None = None) -> int:
+        raise SpotifyRateLimited("GET /me/playlists", 60)
+
+    globals()["_dispatch"] = _limited_dispatch
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = main([])
+    finally:
+        globals()["_dispatch"] = real_dispatch
+    check(
+        rc == EXIT_RATE_LIMITED and out.getvalue().startswith("RATE_LIMITED"),
+        "a rate-limited command exits 75 with RATE_LIMITED, not a traceback",
+    )
+    check(
+        issubclass(SpotifyRateLimited, RuntimeError) and "429" in str(SpotifyRateLimited("x", 5)),
+        "the rate-limit error still reads as a 429 RuntimeError (watch_plays back-off)",
+    )
+
+    # Writes: a 429 raises SpotifyRateLimited, never a fallback path or a new playlist.
+    sp429.http.s = _LimitedSession("86400")
+    for label, call in (
+        ("replace", lambda: sp429.replace_playlist_tracks("p1", ["spotify:track:x"])),
+        ("change", lambda: sp429.change_playlist("p1", name="n")),
+        ("create", lambda: sp429.create_playlist("u1", "n", "d")),
+    ):
+        sp429.http.s.calls = 0
+        try:
+            call()
+            check(False, f"a 429 on {label} raises SpotifyRateLimited")
+        except SpotifyRateLimited:
+            check(sp429.http.s.calls == 1, f"a 429 on {label} raises SpotifyRateLimited after one request")
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        write_json(p.config, {"playlist_id": "pl1", "track_count": 1})
+        write_json(p.last_mix, {"tracks": [{"id": "T", "uri": "spotify:track:T"}]})
+
+        class _PublishSp:
+            created = 0
+
+            def me(self) -> dict:
+                return {"id": "u1"}
+
+            def get_ok(self, path: str, params: dict | None = None) -> tuple[int, Any]:
+                return 429, {"error": {"status": 429}}
+
+            def create_playlist(self, *a: Any, **k: Any) -> dict:
+                self.created += 1
+                return {"id": "dup"}
+
+        pub_sp = _PublishSp()
+        real_load_client = load_client
+        globals()["load_client"] = lambda *a, **k: pub_sp
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_publish(p)
+            check(False, "a 429 on the stored-playlist lookup raises")
+        except SpotifyRateLimited:
+            check(True, "a 429 on the stored-playlist lookup raises")
+        finally:
+            globals()["load_client"] = real_load_client
+        check(
+            pub_sp.created == 0 and read_json(p.config, {})["playlist_id"] == "pl1",
+            "a rate-limited publish never creates a duplicate Discovery Mix",
+        )
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        write_json(p.last_mix, {"tracks": [{"id": "T", "uri": "spotify:track:T"}]})
+
+        class _FreshSp:
+            def me(self) -> dict:
+                return {"id": "u1"}
+
+            def create_playlist(self, *a: Any, **k: Any) -> dict:
+                return {"id": "new1"}
+
+            def replace_playlist_tracks(self, pid: str, uris: list[str]) -> None:
+                raise SpotifyRateLimited(f"replace playlist {pid}", 3600)
+
+        real_load_client = load_client
+        globals()["load_client"] = lambda *a, **k: _FreshSp()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_publish(p)
+        except SpotifyRateLimited:
+            pass
+        finally:
+            globals()["load_client"] = real_load_client
+        check(
+            read_json(p.config, {}).get("playlist_id") == "new1",
+            "a created playlist is recorded before a rate-limited fill (no second orphan)",
+        )
+
+    # 16. Library playlists are cached by snapshot_id; a 429 uses the cache.
+    class _SnapSp:
+        caps = SpotifyCaps()
+
+        def __init__(self) -> None:
+            self.snaps = {"a": "s1", "b": "s1"}
+            self.reads: list[str] = []
+            self.limited: set[str] = set()
+
+        def created_playlists(self, uid: str) -> list[dict]:
+            return [
+                {"id": pid, "name": f"List {pid}", "snapshot_id": snap}
+                for pid, snap in self.snaps.items()
+            ]
+
+        def playlist_items(self, pid: str) -> list[dict]:
+            self.reads.append(pid)
+            if pid in self.limited:
+                raise SpotifyRateLimited(f"playlist {pid}", 3600)
+            return [
+                {
+                    "id": f"{pid}-{self.snaps[pid]}",
+                    "name": f"Song {pid}",
+                    "artists": [{"id": f"{pid}-art", "name": f"Artist {pid}"}],
+                    "available_markets": ["US"] * 100,
+                }
+            ]
+
+        def liked_tracks(self) -> list[dict]:
+            return []
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        snap_sp = _SnapSp()
+        mx = Mixer.__new__(Mixer)
+        mx.sp, mx.paths, mx.cfg = snap_sp, p, MixConfig(today=today, use_likes=False, min_seed_count=1)
+
+        def _collect() -> set[str]:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return Mixer.collect_library(mx, "u1")[1]
+
+        first = _collect()
+        check(sorted(snap_sp.reads) == ["a", "b"], "first run reads every playlist")
+        check(
+            "available_markets" not in json.dumps(read_json(p.playlist_cache, {})),
+            "the cache keeps only id/title/artists",
+        )
+        snap_sp.reads.clear()
+        check(_collect() == first and snap_sp.reads == [], "unchanged snapshots cost zero playlist reads")
+
+        snap_sp.snaps["b"] = "s2"
+        snap_sp.reads.clear()
+        excl = _collect()
+        check(snap_sp.reads == ["b"] and "b-s2" in excl, "a changed snapshot is re-read")
+
+        snap_sp.snaps["a"] = "s3"
+        snap_sp.limited = {"a"}
+        snap_sp.reads.clear()
+        excl = _collect()
+        check("a-s1" in excl, "a 429 on a changed playlist falls back to its cached tracks")
+        check(
+            read_json(p.playlist_cache, {})["a"]["snapshot_id"] == "s1",
+            "the stale copy keeps its old snapshot so the next run retries",
+        )
+        check("song a|artist a" in mx.owned_title_keys, "cached tracks still feed the owned title keys")
+
+        del snap_sp.snaps["b"]
+        snap_sp.limited = set()
+        _collect()
+        check("b" not in read_json(p.playlist_cache, {}), "a deleted playlist leaves the cache")
+
+        write_json(p.playlist_cache, {})
+        snap_sp.limited = {"a"}
+        try:
+            _collect()
+            check(False, "a 429 with no cached copy is not treated as empty")
+        except SpotifyRateLimited:
+            check(True, "a 429 with no cached copy is not treated as empty")
+
     print("self_test failures:", failures)
     return 1 if failures else 0
 
@@ -3040,7 +3667,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     sub.add_parser(
         "maybe_refresh",
-        help="if this week's mix is fully heard, build and publish a replacement",
+        help="if the mix is heard, old, or idle, build and publish a replacement",
     )
     watch = sub.add_parser(
         "watch_plays",
@@ -3071,7 +3698,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+# EX_TEMPFAIL: Spotify rate-limited this run. State files stay consistent
+# (maybe_refresh restores last_mix); the next hourly run retries.
+EXIT_RATE_LIMITED = 75
+
+
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _dispatch(argv)
+    except SpotifyRateLimited as exc:
+        print(f"RATE_LIMITED {exc}")
+        return EXIT_RATE_LIMITED
+
+
+def _dispatch(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     load_dotenv(Path(args.env_file))
     paths = Paths(root=ROOT, state=Path(args.state_dir))
