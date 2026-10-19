@@ -290,13 +290,15 @@ hours. Health is `scripts/watcher_health.py`:
 Do **not** add currently-playing polling to compensate for a stale or frozen
 bar. That burns Dev Mode quota. Reload the web player / skip-logger instead.
 
-Monday `publish` is still a full overwrite (fresh week). Rolling is the
-mid-week path.
+A Monday `publish` is still a full overwrite (fresh week), but nothing
+depends on it any more: `maybe_refresh` rebuilds on age and idleness by
+itself. Rolling is the mid-week path.
 
 ## Mid-week `maybe_refresh`
 
-`maybe_refresh` is less central once rolling is in place. Keep it for a
-**full rebuild** when the mix is empty or aged.
+`maybe_refresh` is the **full rebuild** for a mix that is empty, used up,
+old, or idle. It runs hourly, so it is also the safety net when no
+Monday `publish` is scheduled.
 
 A mix is "used up" (build + publish a replacement) when any of these is true:
 
@@ -304,9 +306,26 @@ A mix is "used up" (build + publish a replacement) when any of these is true:
 - heard ratio >= `MIX_HEARD_RATIO` (0.9, i.e. 36/40). "40/40 heard" is the
   intended happy path; one region-locked or relinked track must not wedge
   refresh forever
-- the mix is older than `MIX_MAX_AGE_DAYS` (14), even if unheard
+- it was published `MIX_MAX_AGE_DAYS` (default 7) ago, even if it is
+  still rolling. This is the weekly rebuild, built in
+- it is **idle**: no publish and no roll that wrote the playlist for
+  `MIX_IDLE_DAYS` (default 3), measured from the later of `published_at`
+  and `rolled_at`. Rolling only moves on hears, so an unlistened mix
+  (0/40 heard) never rolls. On 2026-10-08 a mix stalled that way for
+  11 days with the Monday publish paused, because the only time limit
+  was 14 days
 
 If there is no current mix at all, `maybe_refresh` bootstraps one.
+
+The replacement build excludes **every track of the mix it replaces**.
+The pick RNG is week-stable and unheard tracks are not in the play log,
+so an idle rebuild inside the same ISO week would otherwise publish the
+same songs again. Excluded tracks can return in a later mix.
+
+`build_mix` rewrites `last_mix.json` before `publish` runs. If the build
+or the publish fails, `maybe_refresh` restores the previous
+`last_mix.json`, so it keeps matching the live playlist and the age and
+idle clocks still see the stale mix on the next hourly run.
 
 `persist_mix` and `publish` refuse to replace a good mix with a much smaller
 one (`MIX_MIN_REPLACE_RATIO` = 0.6) unless `--force`. A rate-limited build
@@ -322,7 +341,8 @@ one-track top-up is the intended write.
 | Sleep-track leakage | Ambient/rain/spa titles in a "popular discovery" mix | Junk filter + stricter resolve + search-rank |
 | ListenBrainz miss | Few similar artists; fallback to seed artists' own unheard hits | Normal; MusicBrainz rate limit is ~1 req/s |
 | Path C lookalikes | Search returns the wrong act | Primary-artist match; still possible if Spotify's first hit is wrong |
-| Dev Mode quota | 429 on search / playlist reads | Thin builds are refused; re-run when quota recovers |
+| Dev Mode quota | 429 on search / playlist reads | Short `Retry-After` (<= 60s, delta-seconds or HTTP-date) is waited out. Longer ones raise `SpotifyRateLimited`; the command prints `RATE_LIMITED` and exits 75. Library playlists are cached by `snapshot_id` (`state/playlist_cache.json`), so unchanged ones cost no request, and a 429 on a changed one uses its cached copy. With no cached copy it still refuses rather than read the playlist as empty. Thin builds are refused; re-run when quota recovers |
+| Unlistened mix | Date added frozen for days; `ROLL noop` every hour; 0/40 heard | `MIX_IDLE_DAYS` rebuild via `maybe_refresh` |
 | Unreadable playlist | Used to look empty and drop excludes | `playlist_items` now raises on non-404 errors |
 | Missing / broken `.venv` | Mix commands fall through to system python; `import requests` fails | `./scripts/ensure_venv.sh` before mix commands |
 | Frozen now-playing bar | `watcher_alive` stays fresh; `nowplaying.jsonl` stuck on one title; ingest sees nothing new | `scripts/watcher_health.py`; reload the web player. Do not poll currently-playing |
@@ -341,6 +361,8 @@ MusicBrainz and ListenBrainz need no key and are not configured.
 | `MIX_MIN_SEED_COUNT` | `2` | Minimum primary-artist appearances before seeding |
 | `MIX_MAX_PATH_C` | `10` | Max Path C guesses **when measured tracks exist**. Ignored for a guess-only mix |
 | `MIX_ROLL_DELAY_MIN` | `5` | Minutes a heard track stays on the playlist before `roll_playlist` removes it |
+| `MIX_IDLE_DAYS` | `3` | `maybe_refresh` rebuilds a mix whose playlist has not changed for this many days, even at 0 heard |
+| `MIX_MAX_AGE_DAYS` | `7` | `maybe_refresh` rebuilds a mix published this many days ago |
 
 `PATH_C_MAX_RANK` (3) is a code constant, not an env var: only the first three
 search hits per artist may become Path C candidates.

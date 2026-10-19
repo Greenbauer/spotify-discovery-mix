@@ -18,7 +18,7 @@ before changing taste.
 .venv/bin/python mix.py probe         # which Spotify endpoints still work
 .venv/bin/python mix.py ingest_ui     # mark mix tracks from a now-playing JSONL
 .venv/bin/python mix.py roll_playlist # drop delayed hears + songs you already own; append discoveries (~40)
-.venv/bin/python mix.py maybe_refresh # if the current mix is used up, publish a new one
+.venv/bin/python mix.py maybe_refresh # if the mix is heard, 7d old, or 3d unchanged, publish a new one
 .venv/bin/python mix.py watch_plays   # adaptive now-playing poll so short skips count
 python3 scripts/watcher_health.py     # skip-logger health JSON (not watcher_alive)
 ```
@@ -167,6 +167,8 @@ Copy `.env.example` to `.env` (gitignored).
 | `MIX_MIN_SEED_COUNT` | no | default `2`. Primary artist must appear this many times before seeding. |
 | `MIX_MAX_PATH_C` | no | default `10`. Max Path C guesses when measured Spotify-pop tracks exist. Ignored for a guess-only mix. |
 | `MIX_ROLL_DELAY_MIN` | no | default `5`. Minutes a heard mix track stays on the playlist before `roll_playlist` removes it. |
+| `MIX_IDLE_DAYS` | no | default `3`. `maybe_refresh` rebuilds a mix whose playlist has not changed (no publish, no roll that wrote) for this many days, even at 0 heard. |
+| `MIX_MAX_AGE_DAYS` | no | default `7`. `maybe_refresh` rebuilds a mix published this many days ago, even while it rolls. |
 
 ## Local state (`state/`)
 
@@ -176,6 +178,7 @@ Copy `.env.example` to `.env` (gitignored).
 | `last_mix.json` | `build_mix`, `roll_playlist` | the current playlist tracks + week stamp |
 | `played.json` | `log_plays` | track ids played *from our playlist URI* |
 | `similar_cache.json` | `build_mix` | ListenBrainz similar-artist cache (14d) |
+| `playlist_cache.json` | `build_mix`, `roll_playlist` | your playlists' tracks by `snapshot_id`; unchanged playlists are not re-read, and a 429 falls back to this copy. Rewritten each library read, so deleted playlists drop out |
 | `nowplaying.jsonl` | `scripts/nowplaying_*.py` | web-player now-playing log, read by `ingest_ui` |
 | `watcher_alive` | skip-logger keep-alive | mtime only; **not** health. Use `scripts/watcher_health.py` |
 | `watch_plays.pid` | `watch_plays` | pid of the running watcher |
@@ -219,8 +222,15 @@ JSON under `state/` is gitignored except `.gitkeep`.
    frozen title+artists run). `watcher_alive` alone is not that check. The
    hourly path still does not poll currently-playing.
 
-   `maybe_refresh` is the full rebuild when the mix is empty or aged. Monday
-   `publish` still overwrites the whole playlist for a fresh week.
+   `maybe_refresh` is the full rebuild when the mix is empty, mostly heard,
+   `MIX_MAX_AGE_DAYS` (7) old, or idle for `MIX_IDLE_DAYS` (3). Idle means
+   no publish and no roll changed the playlist, which is what an unlistened
+   mix looks like: rolling only moves on hears. The rebuild never republishes
+   the tracks it replaces. A separate Monday `publish` cron is optional now.
+
+   A command that Spotify rate-limits (429 with a long `Retry-After`) prints
+   `RATE_LIMITED ...` and exits `75`. Nothing was half-written; the next
+   hourly run retries.
 
 Similar artists use MusicBrainz + ListenBrainz (no key). Last.fm is not used.
 
