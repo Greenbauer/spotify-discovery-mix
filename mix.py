@@ -547,6 +547,11 @@ class Spotify:
     def _send(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         return self._request(method, path, **kwargs)
 
+    @staticmethod
+    def _raise_if_limited(resp: requests.Response, what: str) -> None:
+        if resp.status_code == 429:
+            raise SpotifyRateLimited(what, retry_after_seconds(resp.headers.get("Retry-After")))
+
     def get_ok(self, path: str, params: dict | None = None) -> tuple[int, Any]:
         resp = self._request("GET", path, params=params)
         body: Any = None
@@ -712,14 +717,17 @@ class Spotify:
     def create_playlist(self, user_id: str, name: str, description: str, public: bool = False) -> dict:
         payload = {"name": name, "description": description, "public": public}
         resp = self._send("POST", "/me/playlists", json=payload)
+        self._raise_if_limited(resp, "create playlist")
         if resp.status_code >= 400:
             resp = self._send("POST", f"/users/{user_id}/playlists", json=payload)
+            self._raise_if_limited(resp, "create playlist")
         if resp.status_code >= 400:
             raise RuntimeError(f"create playlist -> {resp.status_code}: {resp.text[:400]}")
         return resp.json()
 
     def change_playlist(self, playlist_id: str, **fields: Any) -> None:
         resp = self._send("PUT", f"/playlists/{playlist_id}", json=fields)
+        self._raise_if_limited(resp, f"change playlist {playlist_id}")
         if resp.status_code >= 400:
             raise RuntimeError(f"change playlist -> {resp.status_code}: {resp.text[:400]}")
 
@@ -727,6 +735,7 @@ class Spotify:
         body = {"uris": uris}
         for suffix in (self.caps.playlist_items_path, "items", "tracks"):
             resp = self._send("PUT", f"/playlists/{playlist_id}/{suffix}", json=body)
+            self._raise_if_limited(resp, f"replace playlist {playlist_id}")
             if resp.status_code < 400:
                 self.caps.playlist_items_path = suffix
                 return
@@ -1555,6 +1564,10 @@ def cmd_publish(paths: Paths, dry_run: bool = False, force: bool = False) -> Non
     if playlist_id:
         # confirm it still exists / is ours
         code, body = sp.get_ok(f"/playlists/{playlist_id}")
+        if code == 429:
+            # Not "gone": creating a new one here leaves a duplicate Discovery
+            # Mix and orphans the playlist the user follows.
+            raise SpotifyRateLimited(f"playlist {playlist_id} lookup")
         if code >= 400:
             print(f"stored playlist {playlist_id} not reachable ({code}); creating a new one")
             playlist_id = None
@@ -1630,7 +1643,10 @@ def mix_heard_progress(
     age = _age_days(last.get("published_at"), now)
     # rolled_at is only written by a roll that changed the playlist; a noop
     # roll leaves it alone, so this measures time since the last real change.
-    changes = [a for a in (age, _age_days(last.get("rolled_at"), now)) if a is not None]
+    # generated_at covers a build_mix that never got published: without it a
+    # record with no publish or roll stamp would never go idle.
+    stamps = (last.get("rolled_at"), last.get("generated_at"))
+    changes = [a for a in (age, *(_age_days(t, now) for t in stamps)) if a is not None]
     idle = min(changes) if changes else None
 
     reason = None
@@ -2928,6 +2944,7 @@ def cmd_self_test() -> int:
                 return full_four
 
         noop_sp = _NoopSp()
+        rolled_before = read_json(p.last_mix, {}).get("rolled_at")
         built = []
 
         def _no_build(*_a, **_k):
@@ -2946,6 +2963,10 @@ def cmd_self_test() -> int:
         check(
             rc == 0 and noop_sp.replaced is None and not built,
             "noop skips replace and discovery",
+        )
+        check(
+            rolled_before and read_json(p.last_mix, {}).get("rolled_at") == rolled_before,
+            "a noop roll does not touch rolled_at (the idle clock keeps running)",
         )
 
     check(parse_args(["roll_playlist"]).cmd == "roll_playlist", "roll_playlist is a CLI command")
@@ -3109,6 +3130,12 @@ def cmd_self_test() -> int:
             "build skips a song you own under a different release id",
         )
         check("LIKED_ALBUM_holdon" in mx.owned_ids, "owned ids exclude the heard log")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rebuilt = Mixer.build(mx, {"id": "u1"}, extra_exclude={"NEW_song"}, target_size=5)
+        check(
+            "NEW_song" not in [c.track_id for c in rebuilt],
+            "the real build drops extra_exclude ids (maybe_refresh's stale-mix exclusion)",
+        )
 
     # 13. Skip-logger health: watcher_alive can be fresh while nowplaying.jsonl
     #     is stale or frozen on one title. No network; synthetic log rows.
@@ -3284,6 +3311,13 @@ def cmd_self_test() -> int:
             "a failed publish restores last_mix (no unpublished build left behind)",
         )
 
+        # A mix built but never published (build_mix alone) still goes idle.
+        write_json(p.last_mix, {"tracks": stall_tracks, "generated_at": "2026-10-08T00:50:00+00:00"})
+        check(
+            mix_heard_progress(p, now=stall_now, max_age_days=7, idle_days=3)["finished"],
+            "an unpublished build with no publish/roll stamp still ages out by idle",
+        )
+
     # 15. Spotify 429s on reads: parse Retry-After safely, surface a real 429.
     check(retry_after_seconds("7") == 7.0, "Retry-After delta-seconds parses")
     check(retry_after_seconds(None) is None and retry_after_seconds("soon") is None, "bad Retry-After is None")
@@ -3340,6 +3374,54 @@ def cmd_self_test() -> int:
         issubclass(SpotifyRateLimited, RuntimeError) and "429" in str(SpotifyRateLimited("x", 5)),
         "the rate-limit error still reads as a 429 RuntimeError (watch_plays back-off)",
     )
+
+    # Writes: a 429 raises SpotifyRateLimited, never a fallback path or a new playlist.
+    sp429.http.s = _LimitedSession("86400")
+    for label, call in (
+        ("replace", lambda: sp429.replace_playlist_tracks("p1", ["spotify:track:x"])),
+        ("change", lambda: sp429.change_playlist("p1", name="n")),
+        ("create", lambda: sp429.create_playlist("u1", "n", "d")),
+    ):
+        sp429.http.s.calls = 0
+        try:
+            call()
+            check(False, f"a 429 on {label} raises SpotifyRateLimited")
+        except SpotifyRateLimited:
+            check(sp429.http.s.calls == 1, f"a 429 on {label} raises SpotifyRateLimited after one request")
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        write_json(p.config, {"playlist_id": "pl1", "track_count": 1})
+        write_json(p.last_mix, {"tracks": [{"id": "T", "uri": "spotify:track:T"}]})
+
+        class _PublishSp:
+            created = 0
+
+            def me(self) -> dict:
+                return {"id": "u1"}
+
+            def get_ok(self, path: str, params: dict | None = None) -> tuple[int, Any]:
+                return 429, {"error": {"status": 429}}
+
+            def create_playlist(self, *a: Any, **k: Any) -> dict:
+                self.created += 1
+                return {"id": "dup"}
+
+        pub_sp = _PublishSp()
+        real_load_client = load_client
+        globals()["load_client"] = lambda *a, **k: pub_sp
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_publish(p)
+            check(False, "a 429 on the stored-playlist lookup raises")
+        except SpotifyRateLimited:
+            check(True, "a 429 on the stored-playlist lookup raises")
+        finally:
+            globals()["load_client"] = real_load_client
+        check(
+            pub_sp.created == 0 and read_json(p.config, {})["playlist_id"] == "pl1",
+            "a rate-limited publish never creates a duplicate Discovery Mix",
+        )
 
     # 16. Library playlists are cached by snapshot_id; a 429 uses the cache.
     class _SnapSp:

@@ -309,8 +309,9 @@ A mix is "used up" (build + publish a replacement) when any of these is true:
 - it was published `MIX_MAX_AGE_DAYS` (default 7) ago, even if it is
   still rolling. This is the weekly rebuild, built in
 - it is **idle**: no publish and no roll that wrote the playlist for
-  `MIX_IDLE_DAYS` (default 3), measured from the later of `published_at`
-  and `rolled_at`. Rolling only moves on hears, so an unlistened mix
+  `MIX_IDLE_DAYS` (default 3), measured from the latest of `published_at`,
+  `rolled_at`, and `generated_at` (so a `build_mix` that was never published
+  still ages out). Rolling only moves on hears, so an unlistened mix
   (0/40 heard) never rolls. On 2026-10-08 a mix stalled that way for
   11 days with the Monday publish paused, because the only time limit
   was 14 days
