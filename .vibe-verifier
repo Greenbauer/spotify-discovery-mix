@@ -1,0 +1,17 @@
+# Gates this repository subscribes to. One per line: <gate> [args]
+# Catalog, contract, and how to run these locally: https://github.com/Greenbauer/vibe-verifier
+# The job runs on GitHub's hosted runner on purpose: this repository is public, and a self-hosted
+# runner on a public repository would run any fork's pull request on the operator's machine.
+gitleaks
+actionlint
+zizmor
+# cognitive-complexity and bandit ratchet per file: what main already has never blocks, a pull
+# request that adds an over-limit function or a new finding does.
+cognitive-complexity
+bandit
+osv-scanner
+# prose: an em dash, or an en dash used as an aside, on a Markdown line a pull request adds blocks (house
+# style); a curly quote and the pull request description are advisory. Only added lines count.
+prose
+# max-file-lines is NOT subscribed: mix.py is about 3,800 lines, so every change to it would block.
+# Subscribe it once mix.py is split into modules.

@@ -267,6 +267,7 @@ docs/ALGORITHM.md business logic (seeds, excludes, Path B/C, rolling)
 requirements.txt .env.example
 scripts/          skip-logger helpers (nowplaying, ensure_venv, watcher_health)
 state/            local only (gitignored JSON)
+.vibe-verifier    gates every pull request runs (check `Gates`, .github/workflows/vibe-verifier.yml)
 ```
 
 Do not commit `.env`, play logs, playlist ids, or listening history.
