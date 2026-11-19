@@ -54,6 +54,7 @@ from urllib.parse import urlencode
 import requests
 
 from http_client import UA, Http, SpotifyRateLimited, retry_after_seconds  # noqa: F401
+from pool import gather_until_usable
 from state_lock import locked
 
 ROOT = Path(__file__).resolve().parent
@@ -1255,14 +1256,23 @@ class Mixer:
         year, week, _ = self.cfg.today.isocalendar()
         rng = random.Random(f"{year}-W{week:02d}-{user_id}")
 
-        by_artist: list[tuple[str, list[Candidate]]] = []
-        for artist in similar_ranked:
-            if not is_usable_artist_name(artist):
-                continue
-            by_artist.append((artist, self.popular_tracks_for(artist, n=8)))
-            n_cands = sum(len(cs) for _, cs in by_artist)
-            if n_cands >= max(size, self.cfg.size) * 8:
-                break
+        seen_ids = set(exclude)
+        played_log = read_json(self.paths.played, {"plays": []})
+        heard_keys = _heard_title_keys(played_log)
+        heard_keys |= self.owned_title_keys
+
+        def keep(cands: list[Candidate]) -> list[Candidate]:
+            has_measured = any(c.measured for c in cands)
+            return [c for c in cands if not (
+                c.track_id in seen_ids or is_junk_discovery(c.name, c.artists)
+                or _candidate_heard_by_title(c.name, c.artists, heard_keys)
+                or (c.measured and c.popularity < self.cfg.min_popularity)
+                or (has_measured and not c.measured))]
+
+        artists = [a for a in similar_ranked if is_usable_artist_name(a)]
+        by_artist = gather_until_usable(
+            artists, lambda a: self.popular_tracks_for(a, n=8), keep, max(size, self.cfg.size) * 8)
+        print(f"artists with unused candidates: {len(by_artist)} of {len(artists)}")
 
         measured_groups = [(a, cs) for a, cs in by_artist if any(c.measured for c in cs)]
         guess_groups = [(a, cs) for a, cs in by_artist if not any(c.measured for c in cs)]
@@ -1275,22 +1285,9 @@ class Mixer:
             ordered_groups = measured_groups + guess_groups
 
         pool: list[Candidate] = []
-        seen_ids = set(exclude)
-        played_log = read_json(self.paths.played, {"plays": []})
-        heard_keys = _heard_title_keys(played_log)
-        heard_keys |= self.owned_title_keys
         for _artist, cands in ordered_groups:
-            artist_has_measured = any(c.measured for c in cands)
             for cand in cands:
                 if cand.track_id in seen_ids:
-                    continue
-                if _candidate_heard_by_title(cand.name, cand.artists, heard_keys):
-                    continue
-                if is_junk_discovery(cand.name, cand.artists):
-                    continue
-                if cand.measured and cand.popularity < self.cfg.min_popularity:
-                    continue
-                if artist_has_measured and not cand.measured:
                     continue
                 seen_ids.add(cand.track_id)
                 pool.append(cand)
