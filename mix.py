@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import email.utils
 import importlib.util
 import io
 import json
@@ -54,6 +53,9 @@ from urllib.parse import urlencode
 
 import requests
 
+from http_client import UA, Http, SpotifyRateLimited, retry_after_seconds  # noqa: F401
+from state_lock import locked
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_STATE = ROOT / "state"
 SPOTIFY_API = "https://api.spotify.com/v1"
@@ -61,7 +63,6 @@ SPOTIFY_ACCOUNTS = "https://accounts.spotify.com/api/token"
 MB_API = "https://musicbrainz.org/ws/2"
 LB_SIMILAR = "https://labs.api.listenbrainz.org/similar-artists/json"
 LB_SIMILAR_ALGO = "session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_skip_30"
-UA = "spotify-discovery-mix/1.0 (personal discovery mixer)"
 
 # A rebuilt mix this much smaller than the one it replaces is a failed build,
 # not a new mix. build_mix overwrites last_mix.json BEFORE publish is ever
@@ -397,99 +398,6 @@ class Paths:
     @property
     def playlist_cache(self) -> Path:
         return self.state / "playlist_cache.json"
-
-
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
-
-def retry_after_seconds(raw: str | None) -> float | None:
-    """Seconds to wait from a Retry-After header, or None if it is unusable.
-
-    The header is either delta-seconds or an HTTP-date (RFC 9110). A plain
-    float() crashed the whole run on the date form.
-    """
-    text = (raw or "").strip()
-    if not text:
-        return None
-    try:
-        return max(0.0, float(text))
-    except ValueError:
-        pass
-    try:
-        when = email.utils.parsedate_to_datetime(text)
-    except (TypeError, ValueError):
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
-
-
-class SpotifyRateLimited(RuntimeError):
-    """Spotify answered 429 and the wait was too long (or too often) to sit out.
-
-    A RuntimeError, so existing `except RuntimeError` callers keep working; the
-    message keeps "429" for watch_plays' quota back-off.
-    """
-
-    def __init__(self, what: str, retry_after: float | None = None) -> None:
-        self.retry_after = retry_after
-        hint = f" (Retry-After {retry_after:.0f}s)" if retry_after is not None else ""
-        super().__init__(f"{what} -> 429 rate limited{hint}")
-
-
-class Http:
-    def __init__(self, user_agent: str = UA, min_interval: float = 0.0) -> None:
-        self.s = requests.Session()
-        self.s.headers["User-Agent"] = user_agent
-        self.min_interval = min_interval
-        self._last = 0.0
-
-    def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        retries: int = 5,
-        **kwargs: Any,
-    ) -> requests.Response:
-        kwargs.setdefault("timeout", 30)
-        last_exc: Exception | None = None
-        last_429: requests.Response | None = None
-        for attempt in range(retries):
-            gap = self.min_interval - (time.monotonic() - self._last)
-            if gap > 0:
-                time.sleep(gap)
-            try:
-                resp = self.s.request(method, url, **kwargs)
-            except requests.RequestException as exc:
-                last_exc = exc
-                time.sleep(min(8.0, 0.5 * 2**attempt))
-                continue
-            self._last = time.monotonic()
-            if resp.status_code == 429:
-                wait_s = retry_after_seconds(resp.headers.get("Retry-After"))
-                if wait_s is None:
-                    wait_s = min(16.0, 1.0 * 2**attempt)
-                # Spotify Dev Mode can return Retry-After of many hours for
-                # QUOTA_EXCEEDED. Sleeping that long wedges watch_plays; return
-                # the 429 so callers can degrade (e.g. skip recently-played).
-                if wait_s > 60:
-                    return resp
-                last_429 = resp
-                time.sleep(wait_s)
-                continue
-            if resp.status_code in {500, 502, 503, 504}:
-                time.sleep(min(8.0, 0.5 * 2**attempt))
-                continue
-            return resp
-        if last_429 is not None:
-            # Still limited after every short wait: hand back the 429 itself so
-            # callers see a rate limit, not a generic "failed after retries".
-            return last_429
-        if last_exc:
-            raise last_exc
-        raise RuntimeError(f"HTTP {method} {url} failed after retries")
 
 
 # ---------------------------------------------------------------------------
@@ -932,12 +840,31 @@ def _primary_key(c: Candidate) -> str:
     return c.artist_ids[0] if c.artist_ids else (c.artists[0] if c.artists else c.track_id)
 
 
+def skipped_artist_counts(played: dict) -> Counter:
+    """Skips per normalized artist name, from play-log rows marked skipped."""
+    counts: Counter = Counter()
+    for row in played.get("plays") or []:
+        if row.get("outcome") != "skipped":
+            continue
+        for name in row.get("artists") or []:
+            counts[normalize_artist_name(name)] += 1
+    return counts
+
+
+def _skip_factor(c: Candidate, skips: Counter | None) -> float:
+    """Each skip of a candidate's primary artist halves its pick weight."""
+    if not skips or not c.artists:
+        return 1.0
+    return 0.5 ** skips[normalize_artist_name(c.artists[0])]
+
+
 def _weighted_pick(
     pool: list[Candidate],
     need: int,
     rng: random.Random,
     per_artist: Counter,
     max_per_artist: int,
+    skips: Counter | None = None,
 ) -> list[Candidate]:
     picked: list[Candidate] = []
     remaining = pool[:]
@@ -948,7 +875,7 @@ def _weighted_pick(
             if per_artist[_primary_key(c)] >= max_per_artist:
                 continue
             eligible.append(c)
-            weights.append(max(1, c.popularity) ** 1.4)
+            weights.append(max(1, c.popularity) ** 1.4 * _skip_factor(c, skips))
         if not eligible:
             break
         choice = rng.choices(eligible, weights=weights, k=1)[0]
@@ -965,8 +892,11 @@ def select_mix_tracks(
     max_per_artist: int,
     max_path_c: int,
     rng: random.Random,
+    skips: Counter | None = None,
 ) -> list[Candidate]:
     """Pick the final mix. Real Spotify popularity first; Path C ranked next.
+
+    `skips` (from skipped_artist_counts) down-weights artists you skipped.
 
     When any measured tracks exist, Path C guesses fill remaining slots up to
     max_path_c. When the pool is Path C only (Dev Mode, no popularity field),
@@ -979,11 +909,11 @@ def select_mix_tracks(
     guessed.sort(key=lambda c: c.popularity, reverse=True)
 
     per_artist: Counter = Counter()
-    picked = _weighted_pick(measured, size, rng, per_artist, max_per_artist)
+    picked = _weighted_pick(measured, size, rng, per_artist, max_per_artist, skips)
     if len(picked) < size and guessed:
         leftover = size - len(picked)
         need = leftover if not picked else min(max_path_c, leftover)
-        picked.extend(_weighted_pick(guessed, need, rng, per_artist, max_per_artist))
+        picked.extend(_weighted_pick(guessed, need, rng, per_artist, max_per_artist, skips))
 
     picked.sort(key=lambda c: (0 if c.measured else 1, -c.popularity))
     return picked
@@ -1346,7 +1276,8 @@ class Mixer:
 
         pool: list[Candidate] = []
         seen_ids = set(exclude)
-        heard_keys = _heard_title_keys(read_json(self.paths.played, {"plays": []}))
+        played_log = read_json(self.paths.played, {"plays": []})
+        heard_keys = _heard_title_keys(played_log)
         heard_keys |= self.owned_title_keys
         for _artist, cands in ordered_groups:
             artist_has_measured = any(c.measured for c in cands)
@@ -1373,6 +1304,7 @@ class Mixer:
             max_per_artist=self.cfg.max_per_artist,
             max_path_c=self.cfg.max_path_c,
             rng=rng,
+            skips=skipped_artist_counts(played_log),
         )
         return picked
 
@@ -1681,6 +1613,7 @@ def mix_heard_progress(
     }
 
 
+@locked("playlist")
 def cmd_maybe_refresh(
     paths: Paths,
     *,
@@ -1761,6 +1694,7 @@ def _build_roll_replacements(
     return found[:need]
 
 
+@locked("playlist")
 def cmd_roll_playlist(
     paths: Paths,
     *,
@@ -1903,7 +1837,11 @@ def _removable_heard_rows(
     delay_min: int,
     now: datetime | None = None,
 ) -> list[dict]:
-    """Heard-log rows old enough to roll off (see removable_heard_ids)."""
+    """Heard-log rows old enough to roll off (see removable_heard_ids).
+
+    A row the live watcher marked "skipped" rolls off at once: you chose to
+    move past it, so there is nothing to wait for.
+    """
     now = now or datetime.now(timezone.utc)
     delay = timedelta(minutes=max(0, int(delay_min)))
     out: list[dict] = []
@@ -1913,7 +1851,7 @@ def _removable_heard_rows(
         when = parse_played_at(
             row.get("played_at") or row.get("ts") or row.get("heard_at")
         )
-        if when is None or (now - when) >= delay:
+        if row.get("outcome") == "skipped" or when is None or (now - when) >= delay:
             out.append(row)
     return out
 
@@ -2082,7 +2020,13 @@ def _append_heard(
     played_at: str,
     source: str,
     artists: list[str] | None = None,
+    outcome: str | None = None,
 ) -> bool:
+    """Add a play-log row unless the track is already logged.
+
+    `outcome` is "heard" or "skipped" when the live watcher judged the play;
+    older sources leave it unset, which every reader treats as heard.
+    """
     if track_id in _heard_ids(played):
         return False
     row: dict[str, Any] = {
@@ -2095,10 +2039,13 @@ def _append_heard(
     names = [a for a in (artists or []) if a]
     if names:
         row["artists"] = names
+    if outcome:
+        row["outcome"] = outcome
     played.setdefault("plays", []).append(row)
     return True
 
 
+@locked("plays")
 def harvest_plays(
     paths: Paths,
     sp: Spotify | None = None,
@@ -2303,6 +2250,7 @@ def _candidate_heard_by_title(
     return False
 
 
+@locked("plays")
 def ingest_ui_nowplaying(paths: Paths) -> dict:
     """Mark mix tracks heard from the web-player now-playing log.
 

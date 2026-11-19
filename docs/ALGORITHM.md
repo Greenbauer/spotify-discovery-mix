@@ -37,7 +37,8 @@ and the mix would sound like the last week's speakers, not the playlists they
 chose to keep.
 
 Recently-played is used only by `log_plays` / `watch_plays` to mark Discovery Mix
-tracks as heard. It is never a seed.
+tracks as heard, and currently-playing only by the live watcher (`live_watch.py`)
+to tell skips from listens. Neither is ever a seed.
 
 Liked Songs are **excludes always**. They become artist seeds only when
 `MIX_USE_LIKES=1` (default). They are never output.
@@ -209,9 +210,10 @@ The live Discovery Mix is a sliding window, not only a frozen Monday dump.
 with a smaller `target_size` and extra exclude ids, so Path C ranking, junk
 filters, primary-only seeds, and National Forest resolve all still apply.
 
-1. Play detection (`ingest_ui`, `log_plays --recent-only`, `watch_plays`)
+1. Play detection (`live_watch.py`, `ingest_ui`, `log_plays --recent-only`)
    writes a row to `state/played.json` with `track_id`, `played_at`, and
-   optional `artists`.
+   optional `artists`. The live watcher also writes `outcome`: `skipped` or
+   `heard` (see "Live skip detection" below). A row with no `outcome` is heard.
 2. `mix.py roll_playlist` (alias `roll`) reads `state/config.json`
    `playlist_id`, `state/played.json`, `state/last_mix.json`, and the
    current Spotify playlist items (`GET /playlists/{id}/items`, fallback
@@ -222,7 +224,8 @@ filters, primary-only seeds, and National Forest resolve all still apply.
    those tracks on the playlist forever) **and** its `played_at` (or `ts` / `heard_at`) is at least
    `MIX_ROLL_DELAY_MIN` minutes ago (default **5**). A track heard more
    recently stays on the playlist. A heard row with no parseable timestamp
-   is treated as old enough.
+   is treated as old enough. A row with `outcome: skipped` is removed with
+   **no delay**.
    A track is also removed, with **no delay**, when it is already in your
    library (a created playlist or Liked Songs), by id or title+artist. That
    covers a song you like after it lands here. The roll reads your library on
@@ -251,7 +254,54 @@ filters, primary-only seeds, and National Forest resolve all still apply.
    so tracks removed by hand stop counting toward the heard ratio.
 
 `roll_playlist` does **not** ping the user and does **not** call
-currently-playing in a loop. Detection is a separate step.
+currently-playing in a loop. Detection is a separate step; the live watcher
+calls `roll_playlist` itself when a judged play needs one.
+
+### Live skip detection
+
+`live_watch.py` is an always-on loop on the mixer box. It polls
+`GET /me/player/currently-playing`, which sees playback on every device
+(phone, desktop, speakers), every `LIVE_POLL_SECONDS` (5) while the mix plays,
+every 30 s while something else plays, and every 90 s when nothing does. It
+keeps the 5 s pace while a mix track is paused, so a resume is not missed. A
+429 waits out the full `Retry-After` and runs no roll until it ends. A Spotify
+outage (5xx) is retried after a minute and is not reported as an auth failure.
+
+When the track changes it judges the track that just ended, using the
+furthest point it reached:
+
+- **skipped** if it stopped before `LIVE_SKIP_SECONDS` (30 s), or before
+  `LIVE_SKIP_RATIO` (0.5) of its length when that is shorter (songs under a
+  minute). 30 s is where Spotify counts a play, so these are exactly the plays
+  recently-played misses.
+- **heard** otherwise.
+
+Only plays from the Discovery Mix playlist, or of a track on the current mix,
+count. A pause is not a skip: the paused track stays pending, and after 10
+minutes with nothing playing it is logged only if it was already heard. A
+track skipped faster than one poll is never seen and stays on the playlist;
+the first poll after other music or silence can be 30 to 90 s late.
+
+A skip runs `roll_playlist` at once, at most once every
+`LIVE_ROLL_GAP_SECONDS` (60), so the track is replaced within about a
+minute. A heard track schedules a roll for `MIX_ROLL_DELAY_MIN` plus 15 s.
+Each skip of an artist halves that artist's pick weight in later builds and
+rolls (`skipped_artist_counts`); the skipped track itself is excluded like any
+heard track.
+
+Health: the watcher touches `state/live_watcher_alive` after every poll and
+at least once a minute while it waits, and writes `state/live_watcher.json`
+(counts, last event, `auth_failed`, `backing_off_until`).
+`scripts/watcher_health.py --live` reports `needs_restart` when the touch file
+is older than 20 minutes and `needs_user_ping` when Spotify refused the token.
+`scripts/install_live_watcher.sh --ensure` restarts a dead watcher and exits 1
+on an auth failure. The watcher prints `AUTH_FAILED` and is otherwise quiet.
+It holds `state/live_watcher.lock`, so a second copy exits. Writes to
+`played.json` (watcher, `log_plays`, `ingest_ui`) take `state/plays.lock`,
+and rolls and rebuilds (watcher, `roll_playlist`, `maybe_refresh`) take
+`state/playlist.lock`, so the watcher and the hourly routine never overwrite
+each other. It supersedes
+`watch_plays`, which logs a track as heard the moment it starts.
 
 ### Delay plus top-up
 
@@ -271,15 +321,18 @@ remove 1, keep 39, add 1 at the bottom, size 40.
 Skip-watcher / play-log should run, in order:
 
 ```
-ensure_venv → watcher_health → ingest_ui → log_plays --recent-only → roll_playlist → maybe_refresh
+ensure_venv → install_live_watcher.sh --ensure → watcher_health → ingest_ui → log_plays --recent-only → roll_playlist → maybe_refresh
 ```
+
+`install_live_watcher.sh --ensure` restarts the live watcher if it died.
+The hourly `roll_playlist` stays as a backstop for anything it missed.
 
 `./scripts/ensure_venv.sh` recreates `.venv` and installs `requirements.txt`
 when the venv is missing or cannot `import requests`. Mix commands must use
 `.venv/bin/python` after that. System python is a silent degrade.
 
-Skip detection is the web-player bar log (`state/nowplaying.jsonl`), not a
-Spotify currently-playing loop. `state/watcher_alive` is a keep-alive touch
+The web-player bar log (`state/nowplaying.jsonl`) is the older, secondary
+skip source. `state/watcher_alive` is a keep-alive touch
 file only. It can stay fresh while the JSONL is frozen on one title for
 hours. Health is `scripts/watcher_health.py`:
 
@@ -291,8 +344,9 @@ hours. Health is `scripts/watcher_health.py`:
   but content is stale or frozen. Treat that as unhealthy and ping. Do not
   treat `watcher_alive` mtime as health.
 
-Do **not** add currently-playing polling to compensate for a stale or frozen
-bar. That burns Dev Mode quota. Reload the web player / skip-logger instead.
+Do not add more currently-playing polling to compensate for a stale or
+frozen bar: the live watcher is the one poller, paced to stay inside quota.
+Reload the web player instead.
 
 A Monday `publish` is still a full overwrite (fresh week), but nothing
 depends on it any more: `maybe_refresh` rebuilds on age and idleness by
@@ -369,6 +423,10 @@ MusicBrainz and ListenBrainz need no key and are not configured.
 | `MIX_MIN_SEED_COUNT` | `2` | Minimum primary-artist appearances before seeding |
 | `MIX_MAX_PATH_C` | `10` | Max Path C guesses **when measured tracks exist**. Ignored for a guess-only mix |
 | `MIX_ROLL_DELAY_MIN` | `5` | Minutes a heard track stays on the playlist before `roll_playlist` removes it |
+| `LIVE_SKIP_SECONDS` | `30` | Live watcher: a play that stops before this is a skip |
+| `LIVE_SKIP_RATIO` | `0.5` | Live watcher: ...or before this share of the song, when shorter |
+| `LIVE_POLL_SECONDS` | `5` | Live watcher: poll interval while the mix plays |
+| `LIVE_ROLL_GAP_SECONDS` | `60` | Live watcher: minimum gap between rolls it triggers |
 | `MIX_IDLE_DAYS` | `3` | `maybe_refresh` rebuilds a mix whose playlist has not changed for this many days, even at 0 heard |
 | `MIX_MAX_AGE_DAYS` | `7` | `maybe_refresh` rebuilds a mix published this many days ago |
 

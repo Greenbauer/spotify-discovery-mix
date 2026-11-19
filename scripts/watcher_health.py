@@ -6,8 +6,13 @@
 signal: content recency plus whether the same title|artists run has lasted
 too long.
 
-Does not call Spotify. Do not compensate with currently-playing polling
-(Dev Mode quota).
+Does not call Spotify.
+
+`--live` checks the live skip watcher (live_watch.py) instead: its
+`live_watcher_alive` touch file must be fresh, and `live_watcher.json` must not
+report an auth failure. Exit 1 with needs_restart means start it again
+(scripts/install_live_watcher.sh --ensure); needs_user_ping means the Spotify
+token was refused and only a new refresh token fixes it.
 """
 
 from __future__ import annotations
@@ -25,6 +30,9 @@ DEFAULT_STATE = Path(os.environ.get("MIX_STATE_DIR") or (ROOT / "state"))
 DEFAULT_STALE_HOURS = 6.0
 DEFAULT_FROZEN_HOURS = 2.0
 DEFAULT_ALIVE_FRESH_HOURS = 1.0
+# The live watcher touches its file after every poll and at least once a
+# minute while it waits (including a long 429 or auth back-off).
+DEFAULT_LIVE_STALE_MINUTES = 20.0
 
 
 def parse_ts(raw: Any) -> datetime | None:
@@ -201,6 +209,47 @@ def health_from_state(
     )
 
 
+def assess_live(
+    *,
+    health: dict | None,
+    alive_mtime_at: datetime | None,
+    now: datetime,
+    stale_minutes: float = DEFAULT_LIVE_STALE_MINUTES,
+) -> dict[str, Any]:
+    """Live watcher health. No I/O. `now` must be timezone-aware."""
+    age_s = (now - alive_mtime_at).total_seconds() if alive_mtime_at else None
+    alive = age_s is not None and age_s < stale_minutes * 60
+    auth_failed = bool((health or {}).get("auth_failed"))
+    if not alive:
+        reason = "live watcher not running (no fresh live_watcher_alive)"
+    elif auth_failed:
+        reason = "Spotify refused the token (AUTH_FAILED)"
+    else:
+        reason = "ok"
+    return {
+        "ok": alive and not auth_failed,
+        "needs_restart": not alive,
+        "needs_user_ping": alive and auth_failed,
+        "alive_minutes": None if age_s is None else round(age_s / 60, 2),
+        "counts": (health or {}).get("counts"),
+        "last_event": (health or {}).get("last_event"),
+        "reason": reason,
+    }
+
+
+def live_from_state(state_dir: Path, *, now: datetime | None = None) -> dict[str, Any]:
+    path = state_dir / "live_watcher.json"
+    try:
+        health = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    except (OSError, json.JSONDecodeError):
+        health = None
+    return assess_live(
+        health=health,
+        alive_mtime_at=alive_mtime(state_dir / "live_watcher_alive"),
+        now=now or datetime.now(timezone.utc),
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
@@ -230,11 +279,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_ALIVE_FRESH_HOURS,
         help="watcher_alive is fresh if mtime is newer than this (default 1)",
     )
+    p.add_argument(
+        "--live",
+        action="store_true",
+        help="check the live skip watcher (live_watch.py) instead of the web-player log",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.live:
+        report = live_from_state(Path(args.state_dir))
+        print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+        return 0 if report["ok"] else 1
     report = health_from_state(
         Path(args.state_dir),
         stale_hours=args.stale_hours,
