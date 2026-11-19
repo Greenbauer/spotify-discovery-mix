@@ -67,10 +67,13 @@ created playlists (owner == the user)
        1. Spotify /artists/{id}/top-tracks (extended quota only)
        2. Spotify search artist:"Name" type=track  (Dev Mode happy path)
      searched in rank order (up to 80 similar artists) until
-     8 x max(target size, MIX_SIZE) candidates survive the drops below
-     (pool.py). Counting raw hits instead stopped at the same first artists
-     every build and emptied the pool once their songs were all heard, owned
-     or already offered. A fresh library still stops at the same artist.
+     6 x max(target size, 10) candidates survive the drops below, which is
+     what the pool takes (pool.py): 240 for a 40-track build, 60 for a roll
+     after one skip. Counting raw hits instead stopped at the same first
+     artists every build and emptied the pool once their songs were all
+     heard, owned or already offered. Searches are cached for
+     MIX_SEARCH_CACHE_DAYS (7, state/search_cache.json); a 429 on any of
+     them aborts the build (RATE_LIMITED, exit 75), never an empty result.
                 |
                 v
      resolve onto Spotify (primary artist must match; junk titles dropped)
@@ -267,10 +270,14 @@ calls `roll_playlist` itself when a judged play needs one.
 `live_watch.py` is an always-on loop on the mixer box. It polls
 `GET /me/player/currently-playing`, which sees playback on every device
 (phone, desktop, speakers), every `LIVE_POLL_SECONDS` (5) while the mix plays,
-every 30 s while something else plays, and every 90 s when nothing does. It
-keeps the 5 s pace while a mix track is paused, so a resume is not missed. A
-429 waits out the full `Retry-After` and runs no roll until it ends. A Spotify
-outage (5xx) is retried after a minute and is not reported as an auth failure.
+every 30 s while something else plays or a mix track is paused (so a resume
+is seen within one poll), and every 90 s when nothing plays. The 5 s pace is
+only for actual mix playback. A 429 records a `player` cooldown in
+`state/rate_limit.json` (`Retry-After`, else 6 h doubling to 48 h), runs no
+poll or roll until it ends, survives a restart, and clears on the next good
+poll. A roll the watcher triggers that is refused sets a `roll` cooldown;
+the watcher runs no roll until it ends (skips are still recorded). A Spotify outage (5xx) is retried after a minute and is not
+reported as an auth failure.
 
 When the track changes it judges the track that just ended, using the
 furthest point it reached:
@@ -408,7 +415,7 @@ one-track top-up is the intended write.
 | Sleep-track leakage | Ambient/rain/spa titles in a "popular discovery" mix | Junk filter + stricter resolve + search-rank |
 | ListenBrainz miss | Few similar artists; fallback to seed artists' own unheard hits | Normal; MusicBrainz rate limit is ~1 req/s |
 | Path C lookalikes | Search returns the wrong act | Primary-artist match; still possible if Spotify's first hit is wrong |
-| Dev Mode quota | 429 on search / playlist reads | Short `Retry-After` (<= 60s, delta-seconds or HTTP-date) is waited out. Longer ones raise `SpotifyRateLimited` on playlist and library reads and on every playlist write; the command prints `RATE_LIMITED` and exits 75. Search and similar-artist lookups return nothing on a 429 instead, so the build comes out smaller. Library playlists are cached by `snapshot_id` (`state/playlist_cache.json`), so unchanged ones cost no request, and a 429 on a changed one uses its cached copy. With no cached copy it still refuses rather than read the playlist as empty. Thin builds are refused; re-run when quota recovers |
+| Dev Mode quota | 429 on search / playlist reads | Short `Retry-After` (<= 60s, delta-seconds or HTTP-date) is waited out. Longer ones, and `QUOTA_EXCEEDED`, raise `SpotifyRateLimited` on playlist and library reads, every playlist write, and search / related-artists / top-tracks; the command prints `RATE_LIMITED` and exits 75. A refused rebuild or top-up records a `search` cooldown (`state/rate_limit.json`: `Retry-After`, else 6 h doubling to 48 h); until it ends `maybe_refresh` defers with no API call and rolls remove tracks without topping up. Searches are cached 7 days. Library playlists are cached by `snapshot_id` (`state/playlist_cache.json`), so unchanged ones cost no request, and a 429 on a changed one uses its cached copy. With no cached copy it still refuses rather than read the playlist as empty. Thin builds are refused; re-run when quota recovers |
 | Unlistened mix | Date added frozen for days; `ROLL noop` every hour; 0/40 heard | `MIX_IDLE_DAYS` rebuild via `maybe_refresh` |
 | Unreadable playlist | Used to look empty and drop excludes | `playlist_items` now raises on non-404 errors |
 | Missing / broken `.venv` | Mix commands fall through to system python; `import requests` fails | `./scripts/ensure_venv.sh` before mix commands |
@@ -431,6 +438,7 @@ MusicBrainz and ListenBrainz need no key and are not configured.
 | `LIVE_SKIP_SECONDS` | `30` | Live watcher: a play that stops before this is a skip |
 | `LIVE_SKIP_RATIO` | `0.5` | Live watcher: ...or before this share of the song, when shorter |
 | `LIVE_POLL_SECONDS` | `5` | Live watcher: poll interval while the mix plays |
+| `MIX_SEARCH_CACHE_DAYS` | `7` | Days a Spotify search result is reused |
 | `LIVE_ROLL_GAP_SECONDS` | `60` | Live watcher: minimum gap between rolls it triggers |
 | `MIX_IDLE_DAYS` | `3` | `maybe_refresh` rebuilds a mix whose playlist has not changed for this many days, even at 0 heard |
 | `MIX_MAX_AGE_DAYS` | `7` | `maybe_refresh` rebuilds a mix published this many days ago |

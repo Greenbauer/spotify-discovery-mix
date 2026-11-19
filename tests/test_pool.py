@@ -68,7 +68,7 @@ class GatherTest(unittest.TestCase):
 class BuildPoolTest(unittest.TestCase):
     """Nov 18 2026: maybe_refresh found 0 candidates and refused to rebuild."""
 
-    def build(self, extra_exclude, low_pop=0):
+    def build(self, extra_exclude, low_pop=0, target_size=None):
         with tempfile.TemporaryDirectory() as td:
             paths = mix.Paths(root=Path(td), state=Path(td) / "state")
             mx = mix.Mixer.__new__(mix.Mixer)
@@ -80,7 +80,8 @@ class BuildPoolTest(unittest.TestCase):
             mx.popular_tracks_for = lambda artist, n=8: _artist_tracks(artist, n, low_pop)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                built = mix.Mixer.build(mx, {"id": "u1"}, extra_exclude=extra_exclude)
+                built = mix.Mixer.build(mx, {"id": "u1"}, extra_exclude=extra_exclude,
+                                        target_size=target_size)
             return built, out.getvalue()
 
     def test_used_up_top_artists_do_not_empty_the_pool(self):
@@ -92,12 +93,18 @@ class BuildPoolTest(unittest.TestCase):
         self.assertEqual(len(built), 40, log)
         self.assertTrue(all(c.track_id not in used for c in built))
 
-    def test_fresh_library_searches_the_same_artists_as_before(self):
-        # Old rule: stop at 8 x MIX_SIZE = 320 raw hits = 40 artists of 8.
+    def test_fresh_library_stops_once_the_pool_is_full(self):
+        # The pool takes 6 x MIX_SIZE = 240: 30 artists of 8, no searches past that.
         built, log = self.build(set())
         self.assertEqual(len(built), 40)
-        self.assertIn("artists with unused candidates: 40 of 60", log)
+        self.assertIn("artists with unused candidates: 30 of 60", log)
         self.assertIn("candidate pool after filters: 240", log)
+
+    def test_a_one_track_roll_searches_only_a_few_artists(self):
+        # A roll after a skip wants 1 track: target max(1, 10) x 6 = 60 = 8 artists.
+        built, log = self.build(set(), target_size=1)
+        self.assertEqual(len(built), 1)
+        self.assertIn("artists with unused candidates: 8 of 60", log)
 
     def test_songs_below_the_popularity_floor_do_not_count(self):
         # Half of every artist's songs are below MIX_MIN_POPULARITY: the search

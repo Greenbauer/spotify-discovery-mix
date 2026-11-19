@@ -20,6 +20,10 @@ roll_playlist right away (at most once every LIVE_ROLL_GAP_SECONDS), so the
 track is replaced within about a minute. A heard track keeps the
 MIX_ROLL_DELAY_MIN delay before the roll that removes it.
 
+Polls every 5 s only while the mix plays (30 s on other music or paused,
+90 s idle). A 429 records a cooldown in state/rate_limit.json (Retry-After,
+else 6 h doubling) and nothing polls until it ends, even after a restart.
+
 Health: touches state/live_watcher_alive every loop and writes
 state/live_watcher.json. `scripts/watcher_health.py --live` reads both.
 Quiet by design: it prints AUTH_FAILED (and flags it in the health file) and
@@ -45,6 +49,7 @@ from typing import Any
 import requests
 
 import mix
+import rate_limit
 from state_lock import state_lock
 
 PLAYER_PATH = "/me/player/currently-playing"
@@ -190,12 +195,12 @@ class RollScheduler:
         at = self.next_at()
         return at is not None and now >= at
 
-    def ran(self, now: float, ok: bool) -> None:
+    def ran(self, now: float, ok: bool, retry_s: float = ROLL_RETRY_S) -> None:
         self.last_run = now
         if ok:
             self.pending = [t for t in self.pending if t > now]
         else:
-            self.pending = [now + ROLL_RETRY_S] + [t for t in self.pending if t > now]
+            self.pending = [now + retry_s] + [t for t in self.pending if t > now]
 
 
 def record_play(paths: mix.Paths, done: Finished, when: datetime) -> bool:
@@ -232,7 +237,7 @@ def is_auth_error(exc: Exception) -> bool:
 
 
 def fetch_player(sp: mix.Spotify) -> tuple[str, Any]:
-    """("ok", body|None) | ("limited", seconds) | ("auth", msg) | ("error", msg)."""
+    """("ok", body|None) | ("limited", SpotifyRateLimited) | ("auth", msg) | ("error", msg)."""
     try:
         # Spotify._request retries once on 401 with a refreshed token.
         resp = sp._request("GET", PLAYER_PATH, params={"additional_types": "track"})
@@ -249,8 +254,7 @@ def fetch_player(sp: mix.Spotify) -> tuple[str, Any]:
         except ValueError:
             return "ok", None
     if code == 429:
-        wait = mix.retry_after_seconds(resp.headers.get("Retry-After"))
-        return "limited", ERROR_RETRY_S if wait is None else wait
+        return "limited", mix.limit_error(resp, "currently-playing")
     if code == 401:
         return "auth", f"currently-playing -> 401: {resp.text[:200]}"
     return "error", f"currently-playing -> {code}"
@@ -265,6 +269,9 @@ class Watcher:
         self.rolls = RollScheduler(settings)
         self.last_active = time.monotonic()
         self.auth_failed = False
+        # True at start so the first good poll clears any leftover (expired)
+        # player cooldown and its doubling.
+        self.limited = True
         self.health: dict[str, Any] = {
             "pid": os.getpid(),
             "started_at": _now().isoformat(),
@@ -286,9 +293,12 @@ class Watcher:
         if status == "auth":
             return self._on_auth_failure(value)
         if status == "limited":
-            return self._back_off(max(float(value), self.settings.poll_mix_s))
+            return self._on_rate_limit(value)
         if status == "ok":
             self.auth_failed = False
+            if self.limited:
+                rate_limit.clear(self.paths.state, "player")
+                self.limited = False
             sleep_for = self._on_snapshot(value)
         else:
             print(f"live_watch: {value}", flush=True)
@@ -309,9 +319,10 @@ class Watcher:
         if snap is not None and snap.is_playing:
             return self.settings.poll_mix_s if snap.from_mix else POLL_OTHER_S
         if self._mix_pending(now):
-            # Paused on a mix track: keep polling fast, or a resume-and-listen
-            # between slow polls would be judged at the pause point.
-            return self.settings.poll_mix_s
+            # Paused on a mix track: the fast pace is only for actual mix
+            # playback (quota), but stay off the 90 s idle pace so a resume
+            # is seen within one 30 s poll.
+            return POLL_OTHER_S
         if isinstance(body, dict) and body.get("is_playing"):
             return POLL_OTHER_S  # playing, but no track item (ad, private session)
         return POLL_IDLE_S
@@ -340,22 +351,44 @@ class Watcher:
         self.auth_failed = True
         return self._back_off(AUTH_RETRY_S)
 
+    def _on_rate_limit(self, exc: Exception) -> float:
+        """Persist the cooldown (Retry-After, else 6 h doubling) and sleep it out."""
+        until = rate_limit.record(self.paths.state, "player", exc.retry_after, exc.reason)
+        self.limited = True
+        print(f"live_watch: {exc}; polling again at {until.isoformat()}", flush=True)
+        return self._back_off(max((until - _now()).total_seconds(), self.settings.poll_mix_s))
+
+    def startup_wait(self) -> float:
+        """Seconds left on a currently-playing cooldown from before a restart."""
+        cool = rate_limit.active(self.paths.state, "player")
+        if not cool:
+            return 0.0
+        self.limited = True
+        until = datetime.fromisoformat(cool["until"])
+        print(f"live_watch: {rate_limit.describe(cool)}", flush=True)
+        return self._back_off(max((until - _now()).total_seconds(), 0.0))
+
     def _back_off(self, seconds: float) -> float:
         until = _now().timestamp() + seconds
         self.health["backing_off_until"] = datetime.fromtimestamp(until, timezone.utc).isoformat()
         return seconds
 
+    def _roll_blocked(self) -> bool:
+        """A refused roll's cooldown (persisted, so it survives a restart)
+        holds every roll, including ones new skips queue meanwhile."""
+        return rate_limit.active(self.paths.state, "roll") is not None
+
     def _maybe_roll(self) -> None:
         now = time.monotonic()
-        if not self.rolls.due(now):
+        if not self.rolls.due(now) or self._roll_blocked():
             return
-        ok = run_roll(self.paths, self.sp)
-        self.rolls.ran(now, ok)
+        ok, retry_s = run_roll(self.paths, self.sp)
+        self.rolls.ran(now, ok, retry_s)
         self.health["counts"]["rolls" if ok else "roll_errors"] += 1
 
     def _cap_to_roll(self, sleep_for: float) -> float:
         at = self.rolls.next_at()
-        if at is None:
+        if at is None or self._roll_blocked():
             return sleep_for
         return max(1.0, min(sleep_for, at - time.monotonic()))
 
@@ -373,14 +406,24 @@ class Watcher:
         (self.paths.state / "live_watcher_alive").touch()
 
 
-def run_roll(paths: mix.Paths, sp: mix.Spotify) -> bool:
+def run_roll(paths: mix.Paths, sp: mix.Spotify) -> tuple[bool, float]:
+    """(ok, seconds before a retry). A rate-limited roll (a playlist read or
+    write refused) waits out its cooldown, not ROLL_RETRY_S."""
     # cmd_roll_playlist holds the "playlist" lock, so it never overlaps the
-    # hourly roll_playlist / maybe_refresh.
+    # hourly roll_playlist / maybe_refresh. A refused top-up search is handled
+    # inside it (tracks still leave; the top-up waits for the cooldown).
     try:
-        return mix.cmd_roll_playlist(paths, sp=sp) == 0
+        ok = mix.cmd_roll_playlist(paths, sp=sp) == 0
+    except mix.SpotifyRateLimited as exc:
+        until = rate_limit.record(paths.state, "roll", exc.retry_after, exc.reason)
+        print(f"live_watch: roll rate limited: {exc}; retry at {until.isoformat()}", flush=True)
+        return False, max((until - _now()).total_seconds(), ROLL_RETRY_S)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 - keep the loop alive
         print(f"live_watch: roll failed: {exc}", flush=True)
-        return False
+        return False, ROLL_RETRY_S
+    if ok:
+        rate_limit.clear(paths.state, "roll")  # resets the doubling
+    return ok, ROLL_RETRY_S
 
 
 def _now() -> datetime:
@@ -435,6 +478,8 @@ def main(argv: list[str] | None = None) -> int:
     with single_instance(paths.state):
         watcher = Watcher(paths, connect(paths), Settings.from_env())
         print(f"live_watch: started pid={os.getpid()}", flush=True)
+        watcher.write_health()
+        watcher.nap(watcher.startup_wait())
         while True:
             sleep_for = watcher.step()
             watcher.write_health()

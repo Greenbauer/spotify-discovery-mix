@@ -171,6 +171,7 @@ Copy `.env.example` to `.env` (gitignored).
 | `LIVE_SKIP_SECONDS` | no | default `30`. Live watcher: a mix track that stops before this is a skip. |
 | `LIVE_SKIP_RATIO` | no | default `0.5`. Live watcher: ...or before this share of its length, when that is shorter. |
 | `LIVE_POLL_SECONDS` | no | default `5`. Live watcher: seconds between polls while the mix plays. |
+| `MIX_SEARCH_CACHE_DAYS` | no | default `7`. Days a Spotify search result is reused from `state/search_cache.json`. |
 | `LIVE_ROLL_GAP_SECONDS` | no | default `60`. Live watcher: minimum seconds between rolls it triggers. |
 | `MIX_IDLE_DAYS` | no | default `3`. `maybe_refresh` rebuilds a mix whose playlist has not changed (no publish, no roll that wrote) for this many days, even at 0 heard. |
 | `MIX_MAX_AGE_DAYS` | no | default `7`. `maybe_refresh` rebuilds a mix published this many days ago, even while it rolls. |
@@ -185,6 +186,8 @@ Copy `.env.example` to `.env` (gitignored).
 | `live_watcher.json` | `live_watch.py` | live watcher health: counts, last event, `auth_failed` |
 | `live_watcher_alive` | `live_watch.py` | touched after every poll; `watcher_health.py --live` reads it |
 | `live_watcher.lock` | `live_watch.py` | single-instance lock |
+| `rate_limit.json` | builds, rolls, `live_watch.py` | Spotify 429 cooldowns by scope (`search`, `player`, `roll`); deleted when the next call succeeds |
+| `search_cache.json` | `build_mix`, `roll_playlist` | Spotify search results (trimmed) for `MIX_SEARCH_CACHE_DAYS`; expired entries dropped on save |
 | `plays.lock`, `playlist.lock` | `state_lock.py` | serialize `played.json` writes and playlist rolls between the watcher and the hourly routine |
 | `live_watcher.log` | `install_live_watcher.sh` | watcher output on the nohup path (systemd uses the journal) |
 | `similar_cache.json` | `build_mix` | ListenBrainz similar-artist cache (14d) |
@@ -239,12 +242,18 @@ JSON under `state/` is gitignored except `.gitkeep`.
    mix looks like: rolling only moves on hears. The rebuild never republishes
    the tracks it replaces. A separate Monday `publish` cron is optional now.
 
-   A command that Spotify rate-limits (429 with a long `Retry-After`) prints
-   `RATE_LIMITED ...` and exits `75`; the next hourly run retries. That covers
-   playlist and library reads and every playlist write. Search and
-   similar-artist lookups that hit a 429 return nothing instead, so the build
-   comes out smaller, and is refused if it falls below 60% of the current mix
-   (see `--force` above).
+   A command that Spotify rate-limits (429 with a long `Retry-After`, or Dev
+   Mode's `QUOTA_EXCEEDED`) prints `RATE_LIMITED ...` and exits `75`. That
+   covers playlist and library reads, every playlist write, and search,
+   related-artists and top-tracks: a refused search is never read as "no
+   results". A refused rebuild or roll top-up records a cooldown in
+   `state/rate_limit.json`: `Retry-After` when Spotify sends one, otherwise 6 h,
+   doubling on each repeat up to 48 h. Until it ends, `maybe_refresh` prints
+   `RATE_LIMITED rebuild deferred: cooldown until ...` and exits 75 with no API
+   call (and no `MIX_FINISHED`), and `roll_playlist` still removes heard and
+   skipped tracks but skips the top-up. A successful run clears it. Searches
+   are cached for `MIX_SEARCH_CACHE_DAYS` (7) in `state/search_cache.json`, so
+   repeat builds and rolls only search for new artists.
 
 Similar artists use MusicBrainz + ListenBrainz (no key). Last.fm is not used.
 
@@ -283,7 +292,9 @@ Discovery Mix track ends it decides:
 
 Pausing is not skipping. A track you skip in under about 5 seconds can slip
 past between polls and stays on the playlist (longer right after other music
-or silence, when polls are 30 to 90 s apart). It stays quiet except for
+or silence, when polls are 30 to 90 s apart). It polls every 5 s only while
+the mix is playing; when Spotify rate-limits it, it stops polling until the
+cooldown in `state/rate_limit.json` ends, even across a restart. It stays quiet except for
 `AUTH_FAILED` when Spotify refuses the token. Thresholds are the `LIVE_*`
 env vars above; details in `docs/ALGORITHM.md`.
 
@@ -307,7 +318,11 @@ mix.py            the mixer CLI
 live_watch.py     always-on skip watcher (currently-playing, rolls on skips)
 http_client.py    HTTP retry / Retry-After helpers (moved out of mix.py)
 state_lock.py     flock locks on state/ shared by the watcher and hourly commands
-tests/            unittest suite for the live watcher
+rate_limit.py     persisted Spotify 429 cooldowns (state/rate_limit.json)
+search_cache.py   Spotify search cache (state/search_cache.json)
+brainz.py         MusicBrainz + ListenBrainz similar-artist clients (moved out of mix.py)
+spotify_auth.py   scopes, authorize URL, token refresh (moved out of mix.py)
+tests/            unittest suites (live watcher, pool, rate limits)
 oauth.py          one-time OAuth helper (writes .env, mode 600)
 docs/ALGORITHM.md business logic (seeds, excludes, Path B/C, rolling)
 pool.py           candidate gathering for builds (search until enough survive the filters)
