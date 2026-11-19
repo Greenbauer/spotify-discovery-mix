@@ -44,10 +44,27 @@ class SpotifyRateLimited(RuntimeError):
     message keeps "429" for watch_plays' quota back-off.
     """
 
-    def __init__(self, what: str, retry_after: float | None = None) -> None:
+    def __init__(self, what: str, retry_after: float | None = None, reason: str | None = None) -> None:
         self.retry_after = retry_after
+        self.reason = reason
         hint = f" (Retry-After {retry_after:.0f}s)" if retry_after is not None else ""
-        super().__init__(f"{what} -> 429 rate limited{hint}")
+        why = f" {reason}" if reason else ""
+        super().__init__(f"{what} -> 429 rate limited{why}{hint}")
+
+
+def limit_error(resp: requests.Response, what: str) -> SpotifyRateLimited:
+    """SpotifyRateLimited for a 429 response: its Retry-After and its body's
+    reason (Dev Mode sends {"reason": "QUOTA_EXCEEDED"}, sometimes nested
+    under "error")."""
+    reason = None
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        err = body.get("error")
+        reason = body.get("reason") or (err.get("reason") if isinstance(err, dict) else None)
+    return SpotifyRateLimited(what, retry_after_seconds(resp.headers.get("Retry-After")), reason)
 
 
 class Http:

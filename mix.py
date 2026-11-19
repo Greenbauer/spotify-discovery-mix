@@ -49,21 +49,20 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 
 import requests
 
-from http_client import UA, Http, SpotifyRateLimited, retry_after_seconds  # noqa: F401
+from brainz import ListenBrainz, MusicBrainz
+from spotify_auth import SCOPES, authorize_url, refresh_access_token  # noqa: F401
+from http_client import UA, Http, SpotifyRateLimited, limit_error, retry_after_seconds  # noqa: F401
+import rate_limit
+from search_cache import SearchCache
 from pool import gather_until_usable
 from state_lock import locked
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_STATE = ROOT / "state"
 SPOTIFY_API = "https://api.spotify.com/v1"
-SPOTIFY_ACCOUNTS = "https://accounts.spotify.com/api/token"
-MB_API = "https://musicbrainz.org/ws/2"
-LB_SIMILAR = "https://labs.api.listenbrainz.org/similar-artists/json"
-LB_SIMILAR_ALGO = "session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_skip_30"
 
 # A rebuilt mix this much smaller than the one it replaces is a failed build,
 # not a new mix. build_mix overwrites last_mix.json BEFORE publish is ever
@@ -83,17 +82,6 @@ MIX_HEARD_RATIO = 0.9
 MIX_MAX_AGE_DAYS = 7
 MIX_IDLE_DAYS = 3
 
-SCOPES = [
-    "playlist-read-private",
-    "playlist-read-collaborative",
-    "user-library-read",
-    "playlist-modify-private",
-    "playlist-modify-public",
-    "user-read-recently-played",
-    "user-read-currently-playing",
-    "user-read-playback-state",
-    "user-read-private",
-]
 
 # ---------------------------------------------------------------------------
 # Seasonal + skip-name rules
@@ -446,9 +434,7 @@ class Spotify:
     def _get(self, path: str, params: dict | None = None) -> Any:
         resp = self._request("GET", path, params=params)
         if resp.status_code == 429:
-            raise SpotifyRateLimited(
-                f"GET {path}", retry_after_seconds(resp.headers.get("Retry-After"))
-            )
+            raise limit_error(resp, f"GET {path}")
         if resp.status_code >= 400:
             raise RuntimeError(f"GET {path} -> {resp.status_code}: {resp.text[:400]}")
         return resp.json()
@@ -459,10 +445,14 @@ class Spotify:
     @staticmethod
     def _raise_if_limited(resp: requests.Response, what: str) -> None:
         if resp.status_code == 429:
-            raise SpotifyRateLimited(what, retry_after_seconds(resp.headers.get("Retry-After")))
+            raise limit_error(resp, what)
 
-    def get_ok(self, path: str, params: dict | None = None) -> tuple[int, Any]:
+    def get_ok(self, path: str, params: dict | None = None, raise_429: bool = False) -> tuple[int, Any]:
+        """(status, body). raise_429: a 429 raises SpotifyRateLimited instead,
+        so a refused lookup is never read as "no results"."""
         resp = self._request("GET", path, params=params)
+        if raise_429:
+            self._raise_if_limited(resp, f"GET {path}")
         body: Any = None
         try:
             body = resp.json()
@@ -522,10 +512,7 @@ class Spotify:
             if code == 404:
                 continue
             if code == 429:
-                raise SpotifyRateLimited(
-                    f"playlist {playlist_id}",
-                    retry_after_seconds(resp.headers.get("Retry-After")),
-                )
+                raise limit_error(resp, f"playlist {playlist_id}")
             if code >= 400:
                 raise RuntimeError(
                     f"playlist {playlist_id} /{suffix} -> {code}. Refusing to treat "
@@ -560,18 +547,18 @@ class Spotify:
 
     def search_tracks(self, q: str, limit: int = 5) -> list[dict]:
         limit = max(1, min(limit, 10))  # Dev Mode max is 10
-        code, body = self.get_ok("/search", {"q": q, "type": "track", "limit": limit})
+        code, body = self.get_ok("/search", {"q": q, "type": "track", "limit": limit}, True)
         if code >= 400:
             return []
         return list(((body or {}).get("tracks") or {}).get("items") or [])
 
     def search_artist(self, name: str) -> dict | None:
-        code, body = self.get_ok("/search", {"q": f'artist:"{name}"', "type": "artist", "limit": 5})
+        code, body = self.get_ok("/search", {"q": f'artist:"{name}"', "type": "artist", "limit": 5}, True)
         if code >= 400:
             return None
         items = list(((body or {}).get("artists") or {}).get("items") or [])
         if not items:
-            code, body = self.get_ok("/search", {"q": name, "type": "artist", "limit": 5})
+            code, body = self.get_ok("/search", {"q": name, "type": "artist", "limit": 5}, True)
             items = list(((body or {}).get("artists") or {}).get("items") or [])
         lowered = name.strip().lower()
         for a in items:
@@ -580,7 +567,7 @@ class Spotify:
         return items[0] if items else None
 
     def related_artists(self, artist_id: str) -> list[dict]:
-        code, body = self.get_ok(f"/artists/{artist_id}/related-artists")
+        code, body = self.get_ok(f"/artists/{artist_id}/related-artists", None, True)
         if code >= 400:
             self.caps.related_artists = False
             return []
@@ -588,7 +575,7 @@ class Spotify:
         return list((body or {}).get("artists") or [])
 
     def artist_top_tracks(self, artist_id: str, market: str = "US") -> list[dict]:
-        code, body = self.get_ok(f"/artists/{artist_id}/top-tracks", {"market": market})
+        code, body = self.get_ok(f"/artists/{artist_id}/top-tracks", {"market": market}, True)
         if code >= 400:
             self.caps.artist_top_tracks = False
             return []
@@ -707,93 +694,6 @@ def _playlist_item_track(raw: dict) -> dict | None:
     return None
 
 
-def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> str:
-    resp = requests.post(
-        SPOTIFY_ACCOUNTS,
-        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
-        auth=(client_id, client_secret),
-        headers={"User-Agent": UA},
-        timeout=30,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"token refresh -> {resp.status_code}: {resp.text[:400]}")
-    token = resp.json().get("access_token")
-    if not token:
-        raise RuntimeError("token refresh returned no access_token")
-    return token
-
-
-def authorize_url(client_id: str, redirect_uri: str) -> str:
-    params = {
-        "client_id": client_id,
-        "response_type": "code",
-        "redirect_uri": redirect_uri,
-        "scope": " ".join(SCOPES),
-    }
-    return "https://accounts.spotify.com/authorize?" + urlencode(params)
-
-
-# ---------------------------------------------------------------------------
-# MusicBrainz / ListenBrainz  (related-artists replacement; no API key)
-# ---------------------------------------------------------------------------
-
-class MusicBrainz:
-    def __init__(self) -> None:
-        self.http = Http(min_interval=1.05)  # MusicBrainz asks for ~1 req/s
-
-    def artist_mbid(self, name: str) -> str | None:
-        resp = self.http.request(
-            "GET",
-            f"{MB_API}/artist/",
-            params={"query": f'artist:"{name}"', "fmt": "json", "limit": 1},
-        )
-        if resp.status_code >= 400:
-            return None
-        artists = (resp.json() or {}).get("artists") or []
-        if not artists:
-            return None
-        return artists[0].get("id")
-
-
-class ListenBrainz:
-    def __init__(self) -> None:
-        self.http = Http(min_interval=0.15)
-
-    def similar_artists(self, mbid: str, limit: int = 12) -> list[tuple[str, float]]:
-        resp = self.http.request("GET", LB_SIMILAR, params={"artist_mbids": mbid, "algorithm": LB_SIMILAR_ALGO})
-        if resp.status_code >= 400:
-            return []
-        try:
-            payload = resp.json()
-        except Exception:
-            return []
-        rows: list[dict] = []
-        if isinstance(payload, list):
-            for block in payload:
-                if isinstance(block, list):
-                    rows.extend(x for x in block if isinstance(x, dict))
-                elif isinstance(block, dict):
-                    rows.append(block)
-        out: list[tuple[str, float]] = []
-        seen: set[str] = set()
-        for row in rows:
-            name = (
-                row.get("artist_credit_name")
-                or row.get("artist_name")
-                or row.get("name")
-                or ""
-            ).strip()
-            other = (row.get("artist_mbid") or "").lower()
-            if not name or other == mbid.lower() or name.lower() in seen:
-                continue
-            seen.add(name.lower())
-            try:
-                score = float(row.get("score") or 0)
-            except (TypeError, ValueError):
-                score = 0.0
-            out.append((name, score))
-        out.sort(key=lambda x: x[1], reverse=True)
-        return out[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +832,25 @@ class Mixer:
 
     def _save_similar_cache(self) -> None:
         write_json(self.paths.similar_cache, self._similar_cache)
+
+    @property
+    def search(self) -> SearchCache:
+        if "_search" not in self.__dict__:
+            paths = self.__dict__.get("paths")
+            path = paths.state / "search_cache.json" if paths else None
+            self._search = SearchCache(path, float(env("MIX_SEARCH_CACHE_DAYS") or 7))
+        return self._search
+
+    def _tracks(self, q: str, limit: int) -> list[dict]:
+        return self.search.get_or_fetch(f"t{limit}:{q}", lambda: [
+            dict(_cacheable_track(h), popularity=h.get("popularity"))
+            for h in self.sp.search_tracks(q, limit=limit)])
+
+    def _artist(self, name: str) -> dict | None:
+        def fetch() -> dict | None:
+            a = self.sp.search_artist(name)
+            return {"id": a.get("id"), "name": a.get("name")} if a else None
+        return self.search.get_or_fetch(f"a:{name.strip().lower()}", fetch)
 
     def played_ids(self) -> set[str]:
         data = read_json(self.paths.played, {"plays": []})
@@ -1073,7 +992,7 @@ class Mixer:
             names = [n for n, _ in self.lb.similar_artists(mbid, limit=limit)]
         # Spotify related-artists only if this app still has it (extended quota).
         if not names and self.sp.caps.related_artists is not False:
-            sp_artist = self.sp.search_artist(artist_name)
+            sp_artist = self._artist(artist_name)
             if sp_artist and sp_artist.get("id"):
                 rel = self.sp.related_artists(sp_artist["id"])
                 names = [a.get("name") for a in rel if a.get("name")][:limit]
@@ -1093,9 +1012,9 @@ class Mixer:
         if not is_usable_artist_name(artist):
             return None
         q = f'track:"{title}" artist:"{artist}"'
-        hits = self.sp.search_tracks(q, limit=5)
+        hits = self._tracks(q, 5)
         if not hits:
-            hits = self.sp.search_tracks(f"{title} {artist}", limit=5)
+            hits = self._tracks(f"{title} {artist}", 5)
         want_t = title.strip().lower()
         exact = None
         starts = None
@@ -1150,7 +1069,7 @@ class Mixer:
 
         # Path B: Spotify artist top-tracks (extended quota / grandfathered).
         if self.sp.caps.artist_top_tracks is not False:
-            sp_artist = self.sp.search_artist(artist_name)
+            sp_artist = self._artist(artist_name)
             if sp_artist and sp_artist.get("id"):
                 for hit in self.sp.artist_top_tracks(sp_artist["id"]):
                     pop = hit.get("popularity")
@@ -1170,7 +1089,7 @@ class Mixer:
         # order is a soft rank: earlier hits score higher, never all equal
         # at the popularity gate.
         if len(found) < 3:
-            hits = self.sp.search_tracks(f'artist:"{artist_name}"', limit=10)
+            hits = self._tracks(f'artist:"{artist_name}"', 10)
             for i, hit in enumerate(hits):
                 if i >= PATH_C_MAX_RANK:
                     break
@@ -1210,12 +1129,18 @@ class Mixer:
             uniq.append(c)
         return uniq
 
-    def build(
-        self,
-        user: dict,
-        extra_exclude: set[str] | None = None,
-        target_size: int | None = None,
-    ) -> list[Candidate]:
+    def build(self, user: dict, extra_exclude: set[str] | None = None,
+              target_size: int | None = None) -> list[Candidate]:
+        """Pick a mix. Saves the search cache even when a 429 aborts the build."""
+        try:
+            return self._build(user, extra_exclude, target_size)
+        finally:
+            if "_search" in self.__dict__:
+                self.search.save()
+                print(f"search cache: {self.search.hits} hits, {self.search.misses} Spotify searches")
+
+    def _build(self, user: dict, extra_exclude: set[str] | None,
+               target_size: int | None) -> list[Candidate]:
         user_id = user["id"]
         _, exclude, raw_seeds = self.collect_library(user_id)
         if extra_exclude:
@@ -1270,8 +1195,9 @@ class Mixer:
                 or (has_measured and not c.measured))]
 
         artists = [a for a in similar_ranked if is_usable_artist_name(a)]
-        by_artist = gather_until_usable(
-            artists, lambda a: self.popular_tracks_for(a, n=8), keep, max(size, self.cfg.size) * 8)
+        # The pool takes 6 per wanted track (a roll of 1 wants >= 10): stop there.
+        target = max(size, 10) * 6
+        by_artist = gather_until_usable(artists, lambda a: self.popular_tracks_for(a, n=8), keep, target)
         print(f"artists with unused candidates: {len(by_artist)} of {len(artists)}")
 
         measured_groups = [(a, cs) for a, cs in by_artist if any(c.measured for c in cs)]
@@ -1291,7 +1217,7 @@ class Mixer:
                     continue
                 seen_ids.add(cand.track_id)
                 pool.append(cand)
-            if len(pool) >= max(size, self.cfg.size) * 6:
+            if len(pool) >= target:
                 break
 
         print(f"candidate pool after filters: {len(pool)}")
@@ -1639,11 +1565,17 @@ def cmd_maybe_refresh(
         f"mix progress: {prog['heard']}/{prog['mix_size']} heard, "
         f"{prog['remaining']} remaining"
     )
-    if not prog["mix_size"]:
-        print("no current mix — building the first one")
-    elif not prog["finished"]:
+    if prog["mix_size"] and not prog["finished"]:
         print("mix still open")
         return 0
+    cool = rate_limit.active(paths.state, "search", now)
+    if cool:
+        # No API call until Spotify's window ends; MIX_FINISHED (which pings
+        # Zach) waits for a run that can actually rebuild.
+        print(f"RATE_LIMITED rebuild deferred: {rate_limit.describe(cool)}")
+        return EXIT_RATE_LIMITED
+    if not prog["mix_size"]:
+        print("no current mix — building the first one")
     else:
         print(f"MIX_FINISHED ({prog['finished_reason']})")
 
@@ -1651,7 +1583,9 @@ def cmd_maybe_refresh(
     try:
         build_fn(paths, extra_exclude=_mix_track_ids(paths))
         publish_fn(paths)
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, SpotifyRateLimited):
+            rate_limit.record(paths.state, "search", exc.retry_after, exc.reason, now)
         # build_mix rewrites last_mix.json before publish runs. If publish then
         # fails (a 429 on the write), last_mix would describe tracks that never
         # reached Spotify, with no published_at: the age and idle clocks go
@@ -1663,6 +1597,7 @@ def cmd_maybe_refresh(
             # like a fresh, open mix and block the retry for MIX_IDLE_DAYS.
             paths.last_mix.unlink(missing_ok=True)
         raise
+    rate_limit.clear(paths.state, "search")
     last = read_json(paths.last_mix, {})
     n = len(last.get("tracks") or [])
     print(f"NEW_MIX {n}")
@@ -1680,6 +1615,23 @@ def _build_roll_replacements(
 ) -> list[Candidate]:
     if need <= 0:
         return []
+    cool = rate_limit.active(paths.state, "search")
+    if cool:
+        print(f"top-up skipped, Spotify search {rate_limit.describe(cool)}")
+        return []
+    try:
+        found = _build_replacements(paths, sp, cfg, extra_exclude, need, build_fn)
+    except SpotifyRateLimited as exc:
+        # Still remove the heard / skipped tracks; top up after the cooldown.
+        until = rate_limit.record(paths.state, "search", exc.retry_after, exc.reason)
+        print(f"top-up skipped: {exc}; cooldown until {until.isoformat()}")
+        return []
+    rate_limit.clear(paths.state, "search")
+    return found
+
+
+def _build_replacements(paths: Paths, sp: Spotify, cfg: MixConfig, extra_exclude: set[str],
+                        need: int, build_fn: Any) -> list[Candidate]:
     if build_fn is not None:
         user = sp.me() if hasattr(sp, "me") else {"id": "u"}
         found = build_fn(user, extra_exclude=extra_exclude, target_size=need)
@@ -2567,7 +2519,8 @@ def cmd_self_test() -> int:
         Mixer.resolve_track(mx, "Blue Monday", "New Order") is None,
         "resolve_track drops a hit by the wrong artist",
     )
-    mx.sp = _SearchSp(["New Order"])
+    mx = Mixer.__new__(Mixer)  # fresh: searches are cached per Mixer
+    mx.sp, mx.cfg = _SearchSp(["New Order"]), MixConfig()
     check(
         (Mixer.resolve_track(mx, "Blue Monday", "New Order") or {}).get("id") == "H",
         "resolve_track still accepts the right artist",
@@ -3326,9 +3279,11 @@ def cmd_self_test() -> int:
             "a failed publish restores last_mix (no unpublished build left behind)",
         )
         p.last_mix.unlink()
+        rate_limit.clear(p.state, "search")  # the 429 above set a cooldown
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 cmd_maybe_refresh(p, now=stall_now, build_fn=_fake_build, publish_fn=_publish_429)
+            check(False, "a failed first publish propagates")
         except SpotifyRateLimited:
             pass
         check(

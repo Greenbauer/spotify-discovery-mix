@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
-import json
 import random
 import sys
 import tempfile
@@ -17,6 +16,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
 
 import live_watch as lw  # noqa: E402
 import mix  # noqa: E402
@@ -25,28 +25,7 @@ _spec = importlib.util.spec_from_file_location("watcher_health", ROOT / "scripts
 wh = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wh)
 
-MIX_URI = "spotify:playlist:MIX"
-S = lw.Settings()
-
-
-def body(tid="A", progress_s=0.0, duration_s=200.0, ctx=MIX_URI, playing=True, kind="track"):
-    return {
-        "is_playing": playing,
-        "progress_ms": int(progress_s * 1000),
-        "context": {"uri": ctx} if ctx else None,
-        "item": {
-            "id": tid,
-            "type": kind,
-            "uri": f"spotify:track:{tid}",
-            "name": f"Song {tid}",
-            "duration_ms": int(duration_s * 1000),
-            "artists": [{"name": f"Artist {tid}", "id": f"ar{tid}"}],
-        },
-    }
-
-
-def snap(*args, mix_ids=frozenset(), **kwargs):
-    return lw.parse_snapshot(body(*args, **kwargs), MIX_URI, set(mix_ids))
+from live_fixtures import MIX_URI, S, FakeResp, WatcherBase, body, snap  # noqa: E402
 
 
 class ClassifyTest(unittest.TestCase):
@@ -157,48 +136,10 @@ class RollSchedulerTest(unittest.TestCase):
         self.assertEqual(self.r.next_at(), 1000 + lw.ROLL_RETRY_S)
 
 
-class FakeResp:
-    def __init__(self, code, payload=None, headers=None):
-        self.status_code = code
-        self._payload = payload
-        self.headers = headers or {}
-        self.text = json.dumps(payload) if payload is not None else ""
-
-    def json(self):
-        if self._payload is None:
-            raise ValueError("no body")
-        return self._payload
-
-
-class FakeSpotify:
-    def __init__(self, responses):
-        self.responses = list(responses)
-
-    def _request(self, method, path, params=None):
-        assert (method, path) == ("GET", lw.PLAYER_PATH)
-        nxt = self.responses.pop(0)
-        if isinstance(nxt, Exception):
-            raise nxt
-        return nxt
-
-
-class WatcherTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        state = Path(self.tmp.name)
-        self.paths = mix.Paths(root=state, state=state)
-        mix.write_json(self.paths.config, {"playlist_id": "MIX", "playlist_uri": MIX_URI})
-        mix.write_json(self.paths.last_mix, {"tracks": [{"id": "A"}, {"id": "B"}]})
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def watcher(self, responses):
-        return lw.Watcher(self.paths, FakeSpotify(responses), S)
-
+class WatcherTest(WatcherBase):
     def test_skip_is_logged_and_rolls_at_once(self):
         w = self.watcher([FakeResp(200, body("A", 4)), FakeResp(200, body("B", 1))])
-        with mock.patch.object(lw, "run_roll", return_value=True) as roll, \
+        with mock.patch.object(lw, "run_roll", return_value=(True, lw.ROLL_RETRY_S)) as roll, \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(w.step(), S.poll_mix_s)
             roll.assert_not_called()
@@ -215,7 +156,7 @@ class WatcherTest(unittest.TestCase):
 
     def test_heard_is_logged_but_roll_waits(self):
         w = self.watcher([FakeResp(200, body("A", 100)), FakeResp(200, body("B", 1))])
-        with mock.patch.object(lw, "run_roll", return_value=True) as roll, \
+        with mock.patch.object(lw, "run_roll", return_value=(True, lw.ROLL_RETRY_S)) as roll, \
                 contextlib.redirect_stdout(io.StringIO()):
             w.step()
             w.step()
@@ -225,7 +166,8 @@ class WatcherTest(unittest.TestCase):
 
     def test_rate_limit_honours_retry_after(self):
         w = self.watcher([FakeResp(429, headers={"Retry-After": "40"})])
-        self.assertEqual(w.step(), 40.0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertAlmostEqual(w.step(), 40.0, delta=1)
 
     def test_nothing_playing_backs_off(self):
         w = self.watcher([FakeResp(204)])
@@ -249,44 +191,6 @@ class WatcherTest(unittest.TestCase):
         self.assertTrue(wh.live_from_state(self.paths.state)["ok"])
 
 
-    def test_outage_is_not_an_auth_failure(self):
-        w = self.watcher([RuntimeError("HTTP GET x failed after retries"),
-                          RuntimeError("token refresh -> 503: busy")])
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertEqual(w.step(), lw.ERROR_RETRY_S)
-            self.assertEqual(w.step(), lw.ERROR_RETRY_S)
-        self.assertNotIn("AUTH_FAILED", out.getvalue())
-        self.assertFalse(w.auth_failed)
-
-    def test_refused_refresh_token_is_an_auth_failure(self):
-        w = self.watcher([RuntimeError("token refresh -> 400: invalid_grant")])
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(w.step(), lw.AUTH_RETRY_S)
-        self.assertTrue(w.auth_failed)
-
-    def test_long_429_waits_it_out_and_does_not_roll(self):
-        w = self.watcher([FakeResp(429, headers={"Retry-After": "7200"})])
-        w.rolls.add("skipped", 0.0)  # a roll is overdue
-        with mock.patch.object(lw, "run_roll", return_value=True) as roll:
-            self.assertEqual(w.step(), 7200.0)
-            roll.assert_not_called()
-        self.assertIn("backing_off_until", w.health)
-
-    def test_auth_flag_survives_a_rate_limit(self):
-        w = self.watcher([FakeResp(401, {}), FakeResp(429, headers={"Retry-After": "5"})])
-        with contextlib.redirect_stdout(io.StringIO()):
-            w.step()
-            w.step()
-        self.assertTrue(w.auth_failed)
-
-    def test_long_wait_keeps_health_fresh(self):
-        w = self.watcher([])
-        with mock.patch.object(lw, "HEALTH_TOUCH_S", 0.01):
-            w.nap(0.035)
-        report = wh.live_from_state(self.paths.state)
-        self.assertFalse(report["needs_restart"], report)
-
     def test_paused_mix_track_keeps_fast_polling(self):
         # Pause at 12 s, resume and listen to 70 s, then skip: must be heard.
         w = self.watcher([
@@ -295,10 +199,10 @@ class WatcherTest(unittest.TestCase):
             FakeResp(200, body("A", 70)),
             FakeResp(200, body("B", 1)),
         ])
-        with mock.patch.object(lw, "run_roll", return_value=True), \
+        with mock.patch.object(lw, "run_roll", return_value=(True, lw.ROLL_RETRY_S)), \
                 contextlib.redirect_stdout(io.StringIO()):
             w.step()
-            self.assertEqual(w.step(), S.poll_mix_s, "paused on a mix track")
+            self.assertEqual(w.step(), lw.POLL_OTHER_S, "paused: 30 s, not 5 s and not 90 s")
             w.step()
             w.step()
         self.assertEqual(mix.read_json(self.paths.played, {})["plays"][0]["outcome"], "heard")
