@@ -19,7 +19,8 @@ before changing taste.
 .venv/bin/python mix.py ingest_ui     # mark mix tracks from a now-playing JSONL
 .venv/bin/python mix.py roll_playlist # drop delayed hears + songs you already own; append discoveries (~40)
 .venv/bin/python mix.py maybe_refresh # if the mix is heard, 7d old, or 3d unchanged, publish a new one
-.venv/bin/python mix.py watch_plays   # adaptive now-playing poll so short skips count
+.venv/bin/python mix.py watch_plays   # older poller; logs heard on start, no skips (use live_watch.py)
+.venv/bin/python live_watch.py        # live skip watcher; install with scripts/install_live_watcher.sh
 python3 scripts/watcher_health.py     # skip-logger health JSON (not watcher_alive)
 ```
 
@@ -27,9 +28,9 @@ Run `./scripts/ensure_venv.sh` before mix commands. If `.venv` is gone, falling
 through to system `python3` quietly drops `requests` and skip ingest/publish
 degrade. `state/watcher_alive` is a keep-alive touch file only: it can stay
 fresh while `state/nowplaying.jsonl` is frozen on one title. Use
-`scripts/watcher_health.py` (stale content, frozen bar, keep-alive mask). Do
-not add a currently-playing poll to compensate; that burns Dev Mode quota.
-Skip detection stays the web-player bar log.
+`scripts/watcher_health.py` (stale content, frozen bar, keep-alive mask). Skip
+detection is now the live watcher (see "Live skip detection"); the web-player
+bar log is a secondary source. Do not add another currently-playing poll.
 
 `build_mix` and `publish` take `--force` to overwrite a mix much smaller than the one it
 replaces. Without it they refuse, so a rate-limited build cannot destroy a good mix.
@@ -167,6 +168,10 @@ Copy `.env.example` to `.env` (gitignored).
 | `MIX_MIN_SEED_COUNT` | no | default `2`. Primary artist must appear this many times before seeding. |
 | `MIX_MAX_PATH_C` | no | default `10`. Max Path C guesses when measured Spotify-pop tracks exist. Ignored for a guess-only mix. |
 | `MIX_ROLL_DELAY_MIN` | no | default `5`. Minutes a heard mix track stays on the playlist before `roll_playlist` removes it. |
+| `LIVE_SKIP_SECONDS` | no | default `30`. Live watcher: a mix track that stops before this is a skip. |
+| `LIVE_SKIP_RATIO` | no | default `0.5`. Live watcher: ...or before this share of its length, when that is shorter. |
+| `LIVE_POLL_SECONDS` | no | default `5`. Live watcher: seconds between polls while the mix plays. |
+| `LIVE_ROLL_GAP_SECONDS` | no | default `60`. Live watcher: minimum seconds between rolls it triggers. |
 | `MIX_IDLE_DAYS` | no | default `3`. `maybe_refresh` rebuilds a mix whose playlist has not changed (no publish, no roll that wrote) for this many days, even at 0 heard. |
 | `MIX_MAX_AGE_DAYS` | no | default `7`. `maybe_refresh` rebuilds a mix published this many days ago, even while it rolls. |
 
@@ -176,7 +181,12 @@ Copy `.env.example` to `.env` (gitignored).
 |---|---|---|
 | `config.json` | `publish`, `roll_playlist` | mix playlist id + uri + track_count |
 | `last_mix.json` | `build_mix`, `roll_playlist` | the current playlist tracks + week stamp |
-| `played.json` | `log_plays` | track ids played *from our playlist URI* |
+| `played.json` | `log_plays`, `live_watch.py` | track ids played *from our playlist URI*; live rows add `outcome` (`skipped` / `heard`) |
+| `live_watcher.json` | `live_watch.py` | live watcher health: counts, last event, `auth_failed` |
+| `live_watcher_alive` | `live_watch.py` | touched after every poll; `watcher_health.py --live` reads it |
+| `live_watcher.lock` | `live_watch.py` | single-instance lock |
+| `plays.lock`, `playlist.lock` | `state_lock.py` | serialize `played.json` writes and playlist rolls between the watcher and the hourly routine |
+| `live_watcher.log` | `install_live_watcher.sh` | watcher output on the nohup path (systemd uses the journal) |
 | `similar_cache.json` | `build_mix` | ListenBrainz similar-artist cache (14d) |
 | `playlist_cache.json` | `build_mix`, `roll_playlist` | your playlists' tracks by `snapshot_id`; unchanged playlists are not re-read, and a 429 falls back to this copy. Rewritten each library read, so deleted playlists drop out |
 | `nowplaying.jsonl` | `scripts/nowplaying_*.py` | web-player now-playing log, read by `ingest_ui` |
@@ -216,11 +226,12 @@ JSON under `state/` is gitignored except `.gitkeep`.
 3. After first `publish`, run the hourly play-log / skip-watcher so heard mix
    tracks drop off and stay out of the next pool:
 
-   `ensure_venv` → `watcher_health` → `ingest_ui` → `log_plays --recent-only` → `roll_playlist` → `maybe_refresh`
+   `ensure_venv` → `install_live_watcher.sh --ensure` → `watcher_health` → `ingest_ui` → `log_plays --recent-only` → `roll_playlist` → `maybe_refresh`
 
-   `watcher_health` is the skip-logger check (`nowplaying.jsonl` recency and a
-   frozen title+artists run). `watcher_alive` alone is not that check. The
-   hourly path still does not poll currently-playing.
+   `install_live_watcher.sh --ensure` restarts the live skip watcher if it
+   died (see "Live skip detection"). `watcher_health` is the web-player
+   skip-logger check (`nowplaying.jsonl` recency and a frozen title+artists
+   run). `watcher_alive` alone is not that check.
 
    `maybe_refresh` is the full rebuild when the mix is empty, mostly heard,
    `MIX_MAX_AGE_DAYS` (7) old, or idle for `MIX_IDLE_DAYS` (3). Idle means
@@ -258,14 +269,49 @@ playlist is short but no new discoveries were found. Otherwise it prints
 
 `roll_playlist` does not ping anyone and does not poll currently-playing.
 
+## Live skip detection
+
+`live_watch.py` runs all the time on the mixer box and polls Spotify's
+currently-playing endpoint, so it sees what you play on any device. When a
+Discovery Mix track ends it decides:
+
+- **Skipped**: it stopped before 30 seconds (or before half the song, for a
+  song under a minute). It leaves the playlist at once and a new discovery
+  takes its place, usually within a minute. Each skip also halves that
+  artist's chance of being picked again.
+- **Heard**: anything longer. It leaves after the usual `MIX_ROLL_DELAY_MIN`.
+
+Pausing is not skipping. A track you skip in under about 5 seconds can slip
+past between polls and stays on the playlist (longer right after other music
+or silence, when polls are 30 to 90 s apart). It stays quiet except for
+`AUTH_FAILED` when Spotify refuses the token. Thresholds are the `LIVE_*`
+env vars above; details in `docs/ALGORITHM.md`.
+
+Install on the box (systemd user service if available, otherwise a nohup
+supervisor):
+
+```
+scripts/install_live_watcher.sh              # install and start
+scripts/install_live_watcher.sh --ensure     # hourly: restart only if dead
+scripts/watcher_health.py --live             # health JSON, exit 1 if unhealthy
+scripts/install_live_watcher.sh --uninstall  # stop and remove
+```
+
+Do not also run `mix.py watch_plays`: it logs a track as heard the moment it
+starts. Tests: `.venv/bin/python -m unittest discover tests`.
+
 ## Layout
 
 ```
 mix.py            the mixer CLI
+live_watch.py     always-on skip watcher (currently-playing, rolls on skips)
+http_client.py    HTTP retry / Retry-After helpers (moved out of mix.py)
+state_lock.py     flock locks on state/ shared by the watcher and hourly commands
+tests/            unittest suite for the live watcher
 oauth.py          one-time OAuth helper (writes .env, mode 600)
 docs/ALGORITHM.md business logic (seeds, excludes, Path B/C, rolling)
 requirements.txt .env.example
-scripts/          skip-logger helpers (nowplaying, ensure_venv, watcher_health)
+scripts/          skip-logger helpers (nowplaying, ensure_venv, watcher_health, install_live_watcher)
 state/            local only (gitignored JSON)
 .vibe-verifier    gates every pull request runs (check `Gates`, .github/workflows/vibe-verifier.yml)
 ```
