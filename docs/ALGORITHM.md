@@ -65,6 +65,11 @@ created playlists (owner == the user)
      those artists' popular tracks:
        1. Spotify /artists/{id}/top-tracks (extended quota only)
        2. Spotify search artist:"Name" type=track  (Dev Mode happy path)
+     searched in rank order (up to 80 similar artists) until
+     8 x max(target size, MIX_SIZE) candidates survive the drops below
+     (pool.py). Counting raw hits instead stopped at the same first artists
+     every build and emptied the pool once their songs were all heard, owned
+     or already offered. A fresh library still stops at the same artist.
                 |
                 v
      resolve onto Spotify (primary artist must match; junk titles dropped)

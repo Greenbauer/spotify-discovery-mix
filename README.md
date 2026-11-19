@@ -264,6 +264,7 @@ playlist is short but no new discoveries were found. Otherwise it prints
 mix.py            the mixer CLI
 oauth.py          one-time OAuth helper (writes .env, mode 600)
 docs/ALGORITHM.md business logic (seeds, excludes, Path B/C, rolling)
+pool.py           candidate gathering for builds (search until enough survive the filters)
 requirements.txt .env.example
 scripts/          skip-logger helpers (nowplaying, ensure_venv, watcher_health)
 state/            local only (gitignored JSON)
