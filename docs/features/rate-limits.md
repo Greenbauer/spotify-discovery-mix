@@ -13,7 +13,8 @@ When Spotify answers 429 with a long `Retry-After`, or with Dev Mode's `QUOTA_EX
 
 Nothing to run; this is how the commands behave:
 
-- `build_mix`, `publish`, `roll_playlist` and `maybe_refresh` exit 75 with `RATE_LIMITED ...` on a refused playlist or library read, playlist write, search, related-artists or top-tracks call. A `roll_playlist` whose top-up search is refused still removes tracks and exits 0.
+- `build_mix`, `publish` and `maybe_refresh` exit 75 with `RATE_LIMITED ...` on a refused playlist or library read, playlist write, search, related-artists or top-tracks call. A playlist read that is refused but cached uses the cached copy instead.
+- `roll_playlist` exits 75 only on a refused read of its own playlist, its library read before the top-up, or its playlist write. Its top-up (searches, related artists, top tracks and the top-up's own library read) catches every refusal: the roll still removes tracks and exits 0.
 - `probe` exits 75 only when `GET /me` is refused. A 429 on one of the endpoints it probes is printed as `False`, the same as an endpoint that is gone.
 - `log_plays` and `watch_plays` read a 429 as nothing played: recently-played returns an empty list and currently-playing returns nothing, so they log no plays and exit or keep polling as usual.
 - The live watcher (`live_watch.py`) logs the 429, records a `player` cooldown and keeps running, polling again when it ends.
