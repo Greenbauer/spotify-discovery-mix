@@ -13,5 +13,9 @@ osv-scanner
 # prose: an em dash, or an en dash used as an aside, on a Markdown line a pull request adds blocks (house
 # style); a curly quote and the pull request description are advisory. Only added lines count.
 prose
+# feature-map: docs/features/ owns every mix.py subcommand, every argparse option of the Python scripts,
+# every option of scripts/install_live_watcher.sh, and every entry-point script (oauth.py, live_watch.py,
+# scripts/*). mix.py's own entry point is covered by its subcommands.
+feature-map --surface command mix.py 'sub\.add_parser\(\s*"([a-z_]+)"' --surface option '**/*.py' 'add_argument\(\s*"(--[a-z-]+)"' --surface option scripts/install_live_watcher.sh '^  (--[a-z]+)\) ' --surface script oauth.py --surface script live_watch.py --surface script 'scripts/*'
 # max-file-lines is NOT subscribed: mix.py is about 3,800 lines, so every change to it would block.
 # Subscribe it once mix.py is split into modules.

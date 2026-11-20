@@ -325,6 +325,7 @@ spotify_auth.py   scopes, authorize URL, token refresh (moved out of mix.py)
 tests/            unittest suites (live watcher, pool, rate limits)
 oauth.py          one-time OAuth helper (writes .env, mode 600)
 docs/ALGORITHM.md business logic (seeds, excludes, Path B/C, rolling)
+docs/features/    feature map: one file per command or feature, kept true by the feature-map gate
 pool.py           candidate gathering for builds (search until enough survive the filters)
 requirements.txt .env.example
 scripts/          skip-logger helpers (nowplaying, ensure_venv, watcher_health, install_live_watcher)
