@@ -23,8 +23,8 @@ Run `.venv/bin/python mix.py roll_playlist` (or `roll`) after the first `publish
 
 The `mix.py::` anchors are check messages inside `mix.py self_test`, which runs with no network.
 
-1. Make a new empty folder `D` and run `.venv/bin/python mix.py --env-file D/none.env --state-dir D roll_playlist`: it prints `no playlist_id in state/config.json. Publish first.` and exits 1 before any Spotify call.
-2. Run `.venv/bin/python mix.py roll --help` and `.venv/bin/python mix.py roll_playlist --help`: both print the `roll_playlist` usage.
+1. With `.venv` set up (see [setup](setup.md)), make a new empty folder `D` and run `.venv/bin/python mix.py --env-file D/none.env --state-dir D roll_playlist`: it prints `no playlist_id in state/config.json. Publish first.` and exits 1 before any Spotify call.
+2. With `.venv` set up (see [setup](setup.md)), run `.venv/bin/python mix.py roll --help` and `.venv/bin/python mix.py roll_playlist --help`: both print the `roll_playlist` usage.
 
 re-walk: none -- a command-line tool with no browser page; a real roll reads and writes your Spotify playlist
 

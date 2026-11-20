@@ -13,7 +13,7 @@ Run `.venv/bin/python mix.py probe`. It needs the Spotify tokens in `.env`.
 
 ## Verify
 
-1. Run `.venv/bin/python mix.py probe --help`: it prints `usage: mix.py probe [-h]` and exits 0 without calling Spotify. Never run `probe` itself as a check, because it calls Spotify with your account.
+1. With `.venv` set up (see [setup](setup.md)), run `.venv/bin/python mix.py probe --help`: it prints `usage: mix.py probe [-h]` and exits 0 without calling Spotify. Never run `probe` itself as a check, because it calls Spotify with your account.
 
 re-walk: none -- a command-line tool with no browser page; a real probe calls Spotify with your account
 

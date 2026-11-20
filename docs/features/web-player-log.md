@@ -23,11 +23,12 @@ Run one of `scripts/nowplaying_server.py` or `scripts/nowplaying_watcher.py`; ea
 
 ## Verify
 
-- `mix.py::watcher_health.py loads`
+- `mix.py::fresh watcher_alive cannot mask a frozen bar`
+- `mix.py::fresh watcher_alive cannot mask stale content`
 
-The `mix.py::` anchor is a check message inside `mix.py self_test`, which runs with no network.
+The `mix.py::` anchors are check messages inside `mix.py self_test`, which runs with no network; they cover `watcher_health.py`. No test checks what `ingest_ui` marks heard (`tests/test_live_watch.py` only checks it holds the plays lock), and none covers the two server scripts.
 
-1. Make a new empty folder `D`. Write `D/last_mix.json` holding `{"tracks":[{"id":"T1","uri":"spotify:track:T1","name":"Song One","artists":["Band A"]}]}` and `D/nowplaying.jsonl` holding the one line `{"ts":"2026-11-20T10:00:00Z","title":"Song One","artists":"Band A"}`. Run `.venv/bin/python mix.py --env-file D/none.env --state-dir D ingest_ui`: it prints `heard (web player): Song One` and `new mix plays recorded: 1`, and `D/played.json` gains a row with `"source": "web-player-ui"`.
+1. With `.venv` set up (see [setup](setup.md)), make a new empty folder `D`. Write `D/last_mix.json` holding `{"tracks":[{"id":"T1","uri":"spotify:track:T1","name":"Song One","artists":["Band A"]}]}` and `D/nowplaying.jsonl` holding the one line `{"ts":"2026-11-20T10:00:00Z","title":"Song One","artists":"Band A"}`. Run `.venv/bin/python mix.py --env-file D/none.env --state-dir D ingest_ui`: it prints `heard (web player): Song One` and `new mix plays recorded: 1`, and `D/played.json` gains a row with `"source": "web-player-ui"`.
 2. Make a new empty folder `D` and write `D/nowplaying.jsonl` holding one line with a `ts` more than 6 hours old. Run `python3 scripts/watcher_health.py --state-dir D`: it prints JSON with `"ok":false` and `"stale_content":true`, and exits 1.
 
 re-walk: none -- the browser side is a watcher of the Spotify web player, which needs your signed-in Spotify session

@@ -21,8 +21,8 @@ Run `.venv/bin/python mix.py publish` after `build_mix`. With no saved mix it ru
 
 The `mix.py::` anchors are check messages inside `mix.py self_test`, which runs with no network.
 
-1. Make a new empty folder `D` and write `D/last_mix.json` holding `{"tracks":[{"id":"T1","uri":"spotify:track:T1"}]}`. Run `.venv/bin/python mix.py --env-file D/none.env --state-dir D publish --dry-run`: it prints `publish 1 tracks → playlist 'Discovery Mix'`, then `dry-run: not calling Spotify playlist CRUD`, then `spotify:track:T1`, and exits 0.
-2. Run `.venv/bin/python mix.py publish --help`: it lists `--dry-run` and `--force`.
+1. With `.venv` set up (see [setup](setup.md)), make a new empty folder `D` and write `D/last_mix.json` holding `{"tracks":[{"id":"T1","uri":"spotify:track:T1"}]}`. Run `.venv/bin/python mix.py --env-file D/none.env --state-dir D publish --dry-run`: it prints `publish 1 tracks → playlist 'Discovery Mix'`, then `dry-run: not calling Spotify playlist CRUD`, then `spotify:track:T1`, and exits 0.
+2. With `.venv` set up (see [setup](setup.md)), run `.venv/bin/python mix.py publish --help`: it lists `--dry-run` and `--force`.
 
 re-walk: none -- a command-line tool with no browser page; a real publish writes to your Spotify playlist
 

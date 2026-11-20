@@ -26,6 +26,7 @@ Run `scripts/install_live_watcher.sh` once on the mixer box: it installs a syste
 ## Verify
 
 - `tests/test_live_watch.py::test_early_stop_is_a_skip`
+- `tests/test_live_watch.py::test_thresholds_come_from_env`
 - `tests/test_live_watch.py::test_short_song_uses_half_its_length`
 - `tests/test_live_watch.py::test_skip_is_logged_and_rolls_at_once`
 - `tests/test_live_watch.py::test_heard_is_logged_but_roll_waits`
@@ -36,7 +37,7 @@ Run `scripts/install_live_watcher.sh` once on the mixer box: it installs a syste
 - `tests/test_live_watch_limits.py::test_refused_refresh_token_is_an_auth_failure`
 - `tests/test_live_watch_limits.py::test_long_429_waits_it_out_and_does_not_roll`
 
-1. Run `.venv/bin/python live_watch.py --help`: it prints the usage with `--state-dir` and `--env-file` and exits without polling.
+1. With `.venv` set up (see [setup](setup.md)), run `.venv/bin/python live_watch.py --help`: it prints the usage with `--state-dir` and `--env-file` and exits without polling.
 2. Make a new empty folder `D` and run `python3 scripts/watcher_health.py --live --state-dir D`: it prints JSON with `"needs_restart":true` and the reason `live watcher not running (no fresh live_watcher_alive)`, and exits 1.
 3. Run `scripts/install_live_watcher.sh --help`: it prints `usage: scripts/install_live_watcher.sh [--ensure|--uninstall]` and exits 2 without installing anything.
 

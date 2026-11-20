@@ -24,7 +24,7 @@ Run `.venv/bin/python mix.py maybe_refresh`. It is the last step of the hourly r
 
 The `mix.py::` anchors are check messages inside `mix.py self_test`, which runs with no network.
 
-1. Make a new empty folder `D` and write `D/last_mix.json` holding one track and a `published_at` of the current UTC time, for example `{"tracks":[{"id":"T1","uri":"spotify:track:T1"}],"published_at":"<now in ISO 8601>"}`. Run `.venv/bin/python mix.py --env-file D/none.env --state-dir D maybe_refresh`: it prints `mix progress: 0/1 heard, 1 remaining` and `mix still open`, and exits 0 with no Spotify call.
+1. With `.venv` set up (see [setup](setup.md)), make a new empty folder `D` and write `D/last_mix.json` holding one track and a `published_at` of the current UTC time, for example `{"tracks":[{"id":"T1","uri":"spotify:track:T1"}],"published_at":"<now in ISO 8601>"}`. Run `.venv/bin/python mix.py --env-file D/none.env --state-dir D maybe_refresh`: it prints `mix progress: 0/1 heard, 1 remaining` and `mix still open`, and exits 0 with no Spotify call.
 
 re-walk: none -- a command-line tool with no browser page; a real refresh builds from and writes to your Spotify account
 
@@ -33,5 +33,5 @@ re-walk: none -- a command-line tool with no browser page; a real refresh builds
 - Idle counts from the latest of `published_at`, `rolled_at` and `generated_at`. Rolling only moves on hears, so before the idle rule an unheard mix sat unchanged for 11 days (October 2026).
 - The new build excludes every track of the mix it replaces. The pick is week-stable, so without that a same-week rebuild would publish the same songs again.
 - If the build or the publish fails, the old `last_mix.json` is put back (or removed when there was none), so the next hourly run retries instead of seeing an open mix.
-- During a search cooldown it prints `RATE_LIMITED rebuild deferred: ...` and exits 75 with no Spotify call and no `MIX_FINISHED` line.
+- During a search cooldown, and only when a rebuild is due (the mix is used up, or there is none), it prints `RATE_LIMITED rebuild deferred: ...` and exits 75 with no Spotify call and no `MIX_FINISHED` line. A mix that is still open prints `mix still open` and exits 0 first, cooldown or not.
 - It holds the same `state/playlist.lock` as `roll_playlist`.

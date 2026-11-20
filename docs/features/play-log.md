@@ -26,8 +26,8 @@ After the first `publish`, run `.venv/bin/python mix.py log_plays --recent-only`
 
 The `mix.py::` anchors are check messages inside `mix.py self_test`, which runs with no network.
 
-1. Run `.venv/bin/python mix.py log_plays --help`: it lists `--recent-only`.
-2. Run `.venv/bin/python mix.py watch_plays --help`: it lists `--interval`, `--idle-interval` and `--other-interval` with defaults 12, 90 and 60.
+1. With `.venv` set up (see [setup](setup.md)), run `.venv/bin/python mix.py log_plays --help`: it lists `--recent-only`.
+2. With `.venv` set up (see [setup](setup.md)), run `.venv/bin/python mix.py watch_plays --help`: it lists `--interval`, `--idle-interval` and `--other-interval` with defaults 12, 90 and 60.
 
 re-walk: none -- a command-line tool with no browser page; logging plays reads your Spotify listening
 

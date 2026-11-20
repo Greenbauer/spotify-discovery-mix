@@ -20,9 +20,9 @@ Copy `.env.example` to `.env`, then run `./scripts/ensure_venv.sh` before any mi
 
 ## Verify
 
-- `tests/test_live_watch.py::test_thresholds_come_from_env`
+No test covers setup.
 
-1. Run `.venv/bin/python mix.py --help`: it lists `--state-dir`, `--env-file` and the commands `build_mix`, `publish`, `log_plays`, `ingest_ui`, `roll_playlist` (alias `roll`), `maybe_refresh`, `watch_plays`, `probe`, `self_test` and `print_auth_url`, and exits 0 without reading `.env`.
+1. With `.venv` set up by `./scripts/ensure_venv.sh`, run `.venv/bin/python mix.py --help`: it lists `--state-dir`, `--env-file` and the commands `build_mix`, `publish`, `log_plays`, `ingest_ui`, `roll_playlist` (alias `roll`), `maybe_refresh`, `watch_plays`, `probe`, `self_test` and `print_auth_url`, and exits 0 without reading `.env`.
 2. With `.venv` in place and able to import `requests`, run `./scripts/ensure_venv.sh`: it prints `ensure_venv: .venv ok (...)` and exits 0 without changing anything.
 
 re-walk: none -- a command-line tool with no browser page

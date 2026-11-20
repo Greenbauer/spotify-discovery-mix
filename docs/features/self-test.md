@@ -18,7 +18,7 @@ Run `.venv/bin/python mix.py self_test`. The unit tests are separate: `.venv/bin
 - `mix.py::standalone Thunder (real hit) is kept`
 - `mix.py::select_mix_tracks respects size`
 
-1. Run `.venv/bin/python mix.py self_test`: no line says `FAIL`, and the last line reads `self_test failures: 0`, with exit code 0. A few other lines (the library summary of a fake account, two `ROLL` lines) are printed by the code under test.
+1. With `.venv` set up (see [setup](setup.md)), run `.venv/bin/python mix.py self_test`: no line says `FAIL`, and the last line reads `self_test failures: 0`, with exit code 0. A few other lines (the library summary of a fake account, two `ROLL` lines) are printed by the code under test.
 
 re-walk: none -- a command-line check with no browser page
 

@@ -24,8 +24,8 @@ Register a Spotify developer app (Premium is needed for Dev Mode) with the redir
 
 The `mix.py::` anchors are check messages inside `mix.py self_test`, which runs with no network.
 
-1. Make a new empty folder `D` and run `SPOTIFY_CLIENT_ID=example-client .venv/bin/python mix.py --env-file D/none.env --state-dir D print_auth_url`: it prints an `https://accounts.spotify.com/authorize?client_id=example-client...` URL with the `127.0.0.1:8080/callback` redirect, the nine scopes, and `This script does not start a server or exchange the code.`, and exits 0.
-2. Make a new empty folder `D` and run the same command with `SPOTIFY_CLIENT_ID` unset: it prints `Set SPOTIFY_CLIENT_ID first. This command only prints a URL.` and exits 1.
+1. With `.venv` set up (see [setup](setup.md)), make a new empty folder `D` and run `SPOTIFY_CLIENT_ID=example-client .venv/bin/python mix.py --env-file D/none.env --state-dir D print_auth_url`: it prints an `https://accounts.spotify.com/authorize?client_id=example-client...` URL with the URL-encoded redirect `redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fcallback`, the nine scopes, and `This script does not start a server or exchange the code.`, and exits 0.
+2. With `.venv` set up (see [setup](setup.md)), make a new empty folder `D` and run `env -u SPOTIFY_CLIENT_ID .venv/bin/python mix.py --env-file D/none.env --state-dir D print_auth_url`: it prints `Set SPOTIFY_CLIENT_ID first. This command only prints a URL.` and exits 1.
 
 Never run `oauth.py` as a check: it starts a server and a real sign-in.
 

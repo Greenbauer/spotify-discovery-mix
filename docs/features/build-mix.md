@@ -31,16 +31,16 @@ Run `.venv/bin/python mix.py build_mix`. It needs the Spotify tokens in `.env` (
 
 The `mix.py::` anchors are check messages inside `mix.py self_test`, which runs with no network.
 
-1. Run `.venv/bin/python mix.py build_mix --help`: it lists `--force` and says it overwrites `last_mix.json` even with a much smaller mix.
-2. Run `.venv/bin/python mix.py self_test`: the last line reads `self_test failures: 0`. Never run `build_mix` itself as a check, because it calls Spotify with your account.
+1. With `.venv` set up (see [setup](setup.md)), run `.venv/bin/python mix.py build_mix --help`: it lists `--force` and says it overwrites `last_mix.json` even with a much smaller mix.
+2. With `.venv` set up (see [setup](setup.md)), run `.venv/bin/python mix.py self_test`: the last line reads `self_test failures: 0`. Never run `build_mix` itself as a check, because it calls Spotify with your account.
 
 re-walk: none -- a command-line tool with no browser page; a real build reads your Spotify account
 
 ## Gotchas
 
 - A build refuses to overwrite `last_mix.json` with a mix under 60% of the previous one (`MIX_MIN_REPLACE_RATIO`), so a rate-limited build cannot wipe a good mix. `--force` turns that off.
-- Every track in every playlist you created is excluded from the output, even playlists skipped as seeds (holiday, baby, the Discovery Mix itself). Liked Songs and the play log are excluded too.
+- Every track in every playlist you created is excluded from the output, even playlists skipped as seeds (holiday, baby). Liked Songs and the play log are excluded too. The one exception is the Discovery Mix playlist itself: it is skipped entirely, as neither seed nor exclude, so an unheard track from an earlier mix may come back.
 - The pick is week-stable: two builds in the same ISO week pick the same tracks from the same pool. `maybe_refresh` gets around this by excluding the tracks of the mix it replaces.
-- Spotify's Dev Mode removed the popularity field and artist top-tracks, so most picks come from search rank ("Path C"). A search guess never scores as high as a measured popularity of 55.
+- Spotify's Dev Mode removed the popularity field and artist top-tracks, so most picks come from search rank ("Path C"). A search guess always scores below `MIX_MIN_POPULARITY` (55 by default), so a measured popularity at that floor outranks every guess.
 - The pool keeps searching similar artists until enough candidates survive every filter. Counting raw search hits instead emptied the pool once the first artists' songs were all heard (fixed in #12, pinned by `tests/test_pool.py`).
 - `mix.py` is about 3,700 lines. Recent changes moved helpers out (`brainz.py`, `http_client.py`, `spotify_auth.py`) rather than grow it, and `mix.py` re-exports their names.
